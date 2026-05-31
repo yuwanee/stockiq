@@ -4,36 +4,9 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import os
-import json
-import re
-import time
-import requests
-
-# Shared session with browser-like headers to reduce rate limiting
-_session = requests.Session()
-_session.headers.update({
-    "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.5",
-})
-
-# In-memory result cache — keyed by symbol, expires after CACHE_TTL seconds
-_cache: Dict[str, Dict] = {}
-_cache_ts: Dict[str, float] = {}
-CACHE_TTL = 1800  # 30 minutes
-
-def _cache_get(symbol: str) -> Optional[Dict]:
-    if symbol in _cache and (time.time() - _cache_ts.get(symbol, 0)) < CACHE_TTL:
-        return _cache[symbol]
-    return None
-
-def _cache_set(symbol: str, data: Dict) -> None:
-    _cache[symbol] = data
-    _cache_ts[symbol] = time.time()
+import os, json, re, time, requests
 
 try:
     import anthropic
@@ -41,959 +14,756 @@ try:
 except ImportError:
     ANTHROPIC_AVAILABLE = False
 
-app = FastAPI(title="Stock & ETF Analysis API")
+# ─── App Setup ────────────────────────────────────────────────────────────────
 
-_ALLOWED_ORIGINS = [
-    "http://localhost:5173",
-    "http://localhost:3000",
-    "http://127.0.0.1:5173",
-    # Render / Railway / Fly.io domains (wildcard via regex not supported, but same-origin calls work fine)
-]
-# Allow all origins in production so any deployed URL works
+app = FastAPI(title="StockIQ API")
+
 _ENV = os.environ.get("ENVIRONMENT", "development")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"] if _ENV == "production" else _ALLOWED_ORIGINS,
+    allow_origins=["*"] if _ENV == "production" else ["http://localhost:5173", "http://localhost:3000"],
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
 class AnalyzeRequest(BaseModel):
     symbols: List[str]
 
 
+# ─── Direct Yahoo Finance Client ──────────────────────────────────────────────
+
+class YFClient:
+    """Browser-authenticated Yahoo Finance client — works on cloud servers."""
+
+    BASE1 = "https://query1.finance.yahoo.com"
+    BASE2 = "https://query2.finance.yahoo.com"
+
+    def __init__(self):
+        self._session = requests.Session()
+        self._session.headers.update({
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Accept-Encoding": "gzip, deflate, br",
+        })
+        self._crumb: Optional[str] = None
+        self._crumb_for: str = ""
+
+    def _get_crumb(self, symbol: str) -> bool:
+        """Fetch cookies + crumb from Yahoo Finance page (extracted from HTML)."""
+        if self._crumb and self._crumb_for == symbol:
+            return True
+        try:
+            r = self._session.get(
+                f"https://finance.yahoo.com/quote/{symbol}",
+                timeout=15
+            )
+            m = re.search(r'"crumb":"([^"]+)"', r.text)
+            if m:
+                self._crumb = m.group(1).encode().decode("unicode_escape")
+                self._crumb_for = symbol
+                return True
+        except Exception as e:
+            print(f"Crumb fetch failed: {e}")
+        return False
+
+    def _raw(self, v: Any) -> Any:
+        """Unwrap {raw, fmt} Yahoo Finance value format."""
+        if isinstance(v, dict):
+            return v.get("raw")
+        return v
+
+    def get_history(self, symbol: str, days: int = 375) -> pd.DataFrame:
+        """Fetch daily OHLCV via Yahoo Finance chart API."""
+        self._get_crumb(symbol)
+        end_ts = int(time.time())
+        start_ts = end_ts - days * 86400
+        params = {
+            "period1": start_ts, "period2": end_ts,
+            "interval": "1d", "events": "div,splits",
+        }
+        if self._crumb:
+            params["crumb"] = self._crumb
+
+        for base in [self.BASE1, self.BASE2]:
+            for attempt in range(3):
+                try:
+                    r = self._session.get(
+                        f"{base}/v8/finance/chart/{symbol}",
+                        params=params, timeout=20
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        result = data.get("chart", {}).get("result") or []
+                        if result:
+                            return self._parse_chart(result[0])
+                    elif r.status_code == 401:
+                        self._crumb = None
+                        self._get_crumb(symbol)
+                        if self._crumb:
+                            params["crumb"] = self._crumb
+                except Exception as e:
+                    print(f"History attempt {attempt+1} error: {e}")
+                if attempt < 2:
+                    time.sleep(3 * (attempt + 1))
+        return pd.DataFrame()
+
+    def _parse_chart(self, result: Dict) -> pd.DataFrame:
+        timestamps = result["timestamp"]
+        q = result["indicators"]["quote"][0]
+        adj_list = result["indicators"].get("adjclose") or []
+        adj = adj_list[0].get("adjclose") if adj_list else None
+
+        df = pd.DataFrame({
+            "Open":   q.get("open"),
+            "High":   q.get("high"),
+            "Low":    q.get("low"),
+            "Close":  adj if adj else q.get("close"),
+            "Volume": q.get("volume"),
+        }, index=pd.to_datetime(timestamps, unit="s", utc=True).tz_localize(None))
+        df["Volume"] = df["Volume"].fillna(0).astype(int)
+        return df.dropna(subset=["Close"]).sort_index()
+
+    def get_info(self, symbol: str) -> Dict:
+        """Fetch fundamentals via quoteSummary."""
+        if not self._crumb:
+            self._get_crumb(symbol)
+
+        modules = ",".join([
+            "summaryProfile", "financialData", "defaultKeyStatistics",
+            "quoteType", "price", "summaryDetail", "recommendationTrend",
+            "assetProfile", "topHoldings",
+        ])
+        params = {"modules": modules, "formatted": "false"}
+        if self._crumb:
+            params["crumb"] = self._crumb
+
+        for base in [self.BASE1, self.BASE2]:
+            for attempt in range(3):
+                try:
+                    r = self._session.get(
+                        f"{base}/v10/finance/quoteSummary/{symbol}",
+                        params=params, timeout=20
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        results = (data.get("quoteSummary") or {}).get("result") or []
+                        if results:
+                            return self._parse_info(results[0])
+                    elif r.status_code == 401:
+                        self._crumb = None
+                        self._get_crumb(symbol)
+                        if self._crumb:
+                            params["crumb"] = self._crumb
+                except Exception as e:
+                    print(f"Info attempt {attempt+1} error: {e}")
+                if attempt < 2:
+                    time.sleep(3)
+        return {}
+
+    def _parse_info(self, data: Dict) -> Dict:
+        R = self._raw
+        info: Dict[str, Any] = {}
+
+        qt = data.get("quoteType") or {}
+        info["quoteType"] = qt.get("quoteType", "EQUITY")
+        info["longName"]  = qt.get("longName") or qt.get("shortName")
+        info["currency"]  = qt.get("currency", "USD")
+        info["exchange"]  = qt.get("exchange")
+
+        price = data.get("price") or {}
+        info["marketCap"] = R(price.get("marketCap"))
+        if not info.get("longName"):
+            info["longName"] = price.get("longName") or price.get("shortName")
+
+        for src in ["summaryProfile", "assetProfile"]:
+            p = data.get(src) or {}
+            info.setdefault("sector",               p.get("sector"))
+            info.setdefault("industry",             p.get("industry"))
+            info.setdefault("longBusinessSummary",  p.get("longBusinessSummary"))
+            info.setdefault("fundFamily",           p.get("fundFamily"))
+            info.setdefault("category",             p.get("category"))
+
+        fd = data.get("financialData") or {}
+        for k in ["revenueGrowth","earningsGrowth","grossMargins","operatingMargins",
+                  "profitMargins","returnOnEquity","returnOnAssets","debtToEquity",
+                  "currentRatio","quickRatio","freeCashflow","totalRevenue",
+                  "netIncomeToCommon","targetHighPrice","targetLowPrice","targetMeanPrice",
+                  "recommendationKey","numberOfAnalystOpinions"]:
+            info[k] = R(fd.get(k))
+
+        dks = data.get("defaultKeyStatistics") or {}
+        for k in ["trailingPE","forwardPE","pegRatio","priceToBook","bookValue",
+                  "trailingEps","forwardEps","enterpriseToEbitda","beta3Year",
+                  "threeYearAverageReturn","fiveYearAverageReturn","ytdReturn",
+                  "annualReportExpenseRatio","totalAssets","navPrice"]:
+            info[k] = R(dks.get(k))
+
+        sd = data.get("summaryDetail") or {}
+        for k in ["dividendYield","dividendRate","trailingPE","priceToSalesTrailing12Months",
+                  "totalAssets","yield"]:
+            if info.get(k) is None:
+                info[k] = R(sd.get(k))
+
+        # recommendationMean from trend
+        rt = (data.get("recommendationTrend") or {}).get("trend") or []
+        if rt:
+            t = rt[0]
+            total = sum(t.get(x, 0) for x in ["strongBuy","buy","hold","sell","strongSell"])
+            if total:
+                weighted = (t.get("strongBuy",0)*1 + t.get("buy",0)*2 +
+                            t.get("hold",0)*3 + t.get("sell",0)*4 + t.get("strongSell",0)*5)
+                info["recommendationMean"] = weighted / total
+
+        # ETF holdings from topHoldings
+        th = data.get("topHoldings") or {}
+        if th:
+            info["_topHoldings"] = [
+                {
+                    "symbol": h.get("holdingName") or h.get("symbol",""),
+                    "name":   h.get("holdingName",""),
+                    "weight": R(h.get("holdingPercent")) or 0,
+                }
+                for h in (th.get("holdings") or [])[:15]
+            ]
+            info["_equityHoldings"] = {
+                k: R(v) for k, v in (th.get("equityHoldings") or {}).items() if v
+            }
+            info["_sectorWeightings"] = {}
+            for sw in (th.get("sectorWeightings") or []):
+                for k, v in sw.items():
+                    val = R(v)
+                    if val:
+                        info["_sectorWeightings"][k] = val
+            info["_assetClasses"] = {
+                "stocks":    R(th.get("stockPosition")),
+                "bonds":     R(th.get("bondPosition")),
+                "cash":      R(th.get("cashPosition")),
+                "other":     R(th.get("otherPosition")),
+                "preferred": R(th.get("preferredPosition")),
+            }
+
+        return info
+
+    def get_news(self, symbol: str) -> List[Dict]:
+        try:
+            r = self._session.get(
+                f"{self.BASE1}/v1/finance/search",
+                params={"q": symbol, "newsCount": 10},
+                timeout=10
+            )
+            if r.status_code == 200:
+                return [
+                    {
+                        "title": n.get("title",""),
+                        "publisher": n.get("publisher",""),
+                        "link": n.get("link",""),
+                        "publishedAt": n.get("providerPublishTime", 0),
+                    }
+                    for n in r.json().get("news", [])[:10]
+                ]
+        except Exception:
+            pass
+        return []
+
+
+# Singleton client + 30-min cache
+_yf = YFClient()
+_cache: Dict[str, Dict] = {}
+_cache_ts: Dict[str, float] = {}
+CACHE_TTL = 1800
+
+def _cache_get(symbol: str) -> Optional[Dict]:
+    if symbol in _cache and time.time() - _cache_ts.get(symbol, 0) < CACHE_TTL:
+        return _cache[symbol]
+    return None
+
+def _cache_set(symbol: str, data: Dict) -> None:
+    _cache[symbol] = data
+    _cache_ts[symbol] = time.time()
+
+
 # ─── Technical Indicators ────────────────────────────────────────────────────
 
-def calculate_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
+def calc_rsi(prices: pd.Series, period: int = 14) -> pd.Series:
     delta = prices.diff()
-    gain = delta.where(delta > 0, 0.0).rolling(window=period).mean()
-    loss = (-delta.where(delta < 0, 0.0)).rolling(window=period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
+    gain = delta.where(delta > 0, 0.0).rolling(period).mean()
+    loss = (-delta.where(delta < 0, 0.0)).rolling(period).mean()
+    return 100 - (100 / (1 + gain / loss))
 
+def calc_macd(prices: pd.Series, fast=12, slow=26, signal=9):
+    ef = prices.ewm(span=fast, adjust=False).mean()
+    es = prices.ewm(span=slow, adjust=False).mean()
+    m = ef - es
+    s = m.ewm(span=signal, adjust=False).mean()
+    return m, s, m - s
 
-def calculate_macd(prices: pd.Series, fast=12, slow=26, signal=9):
-    ema_fast = prices.ewm(span=fast, adjust=False).mean()
-    ema_slow = prices.ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line, macd_line - signal_line
+def calc_boll(prices: pd.Series, period=20, k=2.0):
+    sma = prices.rolling(period).mean()
+    std = prices.rolling(period).std()
+    return sma + k*std, sma, sma - k*std
 
+def calc_stoch(high, low, close, kp=14, dp=3):
+    ll = low.rolling(kp).min(); hh = high.rolling(kp).max()
+    k = 100*(close - ll)/(hh - ll)
+    return k, k.rolling(dp).mean()
 
-def calculate_bollinger(prices: pd.Series, period=20, std_dev=2.0):
-    sma = prices.rolling(window=period).mean()
-    std = prices.rolling(window=period).std()
-    return sma + std_dev * std, sma, sma - std_dev * std
-
-
-def calculate_stochastic(high: pd.Series, low: pd.Series, close: pd.Series, k=14, d=3):
-    ll = low.rolling(k).min()
-    hh = high.rolling(k).max()
-    pct_k = 100 * (close - ll) / (hh - ll)
-    return pct_k, pct_k.rolling(d).mean()
-
-
-def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period=14) -> pd.Series:
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
+def calc_atr(high, low, close, period=14):
+    tr = pd.concat([high-low, (high-close.shift()).abs(), (low-close.shift()).abs()], axis=1).max(axis=1)
     return tr.rolling(period).mean()
 
+def calc_obv(close, volume):
+    d = np.sign(close.diff()); d.iloc[0] = 0
+    return (d * volume).cumsum()
 
-def calculate_obv(close: pd.Series, volume: pd.Series) -> pd.Series:
-    direction = np.sign(close.diff())
-    direction.iloc[0] = 0
-    return (direction * volume).cumsum()
-
-
-def to_series(hist: pd.DataFrame, column: str) -> List[Dict]:
-    result = []
-    for idx, row in hist.iterrows():
-        val = row.get(column)
-        if val is not None and not pd.isna(val):
-            result.append({"time": idx.strftime("%Y-%m-%d"), "value": round(float(val), 6)})
-    return result
+def to_series(hist: pd.DataFrame, col: str) -> List[Dict]:
+    return [{"time": idx.strftime("%Y-%m-%d"), "value": round(float(v), 6)}
+            for idx, v in hist[col].items() if not pd.isna(v)]
 
 
-# ─── ETF Performance Metrics ─────────────────────────────────────────────────
+# ─── Signals & Scoring ────────────────────────────────────────────────────────
 
-def calculate_performance_metrics(hist: pd.DataFrame, risk_free_rate: float = 0.053) -> Dict:
-    """Sharpe, Sortino, Calmar, Max Drawdown, CAGR, VaR, volatility, win rate."""
-    if len(hist) < 30:
-        return {}
-    try:
-        daily_returns = hist["Close"].pct_change().dropna()
-        n_days = len(daily_returns)
-        years = n_days / 252
+def generate_signals(hist: pd.DataFrame) -> List[Dict]:
+    if len(hist) < 2: return []
+    lat, prv = hist.iloc[-1], hist.iloc[-2]
+    price = float(lat["Close"])
 
-        # CAGR
-        total_ret = float(hist["Close"].iloc[-1] / hist["Close"].iloc[0]) - 1
-        cagr = float((1 + total_ret) ** (1 / years) - 1) if years > 0 else 0.0
+    def _s(col, row=None):
+        v = (lat if row is None else row).get(col)
+        return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
 
-        # Annualized volatility
-        ann_vol = float(daily_returns.std() * np.sqrt(252))
+    sigs = []
 
-        # Sharpe ratio
-        daily_rf = risk_free_rate / 252
-        excess = daily_returns - daily_rf
-        sharpe = float((excess.mean() / excess.std()) * np.sqrt(252)) if excess.std() > 0 else 0.0
+    rsi = _s("RSI")
+    if rsi is not None:
+        if rsi < 30:    sigs.append({"type":"BULLISH","indicator":"RSI","name":"Oversold","strength":3,"detail":f"RSI={rsi:.1f} — deeply oversold; potential reversal"})
+        elif rsi > 70:  sigs.append({"type":"BEARISH","indicator":"RSI","name":"Overbought","strength":3,"detail":f"RSI={rsi:.1f} — overbought; possible pullback"})
+        elif rsi < 40:  sigs.append({"type":"BULLISH","indicator":"RSI","name":"Near Oversold","strength":1,"detail":f"RSI={rsi:.1f}"})
+        elif rsi > 60:  sigs.append({"type":"BEARISH","indicator":"RSI","name":"Near Overbought","strength":1,"detail":f"RSI={rsi:.1f}"})
+        else:           sigs.append({"type":"NEUTRAL","indicator":"RSI","name":"Neutral","strength":0,"detail":f"RSI={rsi:.1f} — neutral momentum"})
 
-        # Sortino ratio (downside deviation)
-        neg_ret = daily_returns[daily_returns < daily_rf]
-        dn_std = float(neg_ret.std() * np.sqrt(252)) if len(neg_ret) > 5 else ann_vol
-        sortino = float((cagr - risk_free_rate) / dn_std) if dn_std > 0 else 0.0
+    macd, msig = _s("MACD"), _s("MACD_signal")
+    pm, pms = _s("MACD", prv), _s("MACD_signal", prv)
+    if macd is not None and msig is not None:
+        cu = macd > msig and (pm is None or pm <= pms)
+        cd = macd < msig and (pm is None or pm >= pms)
+        if cu:          sigs.append({"type":"BULLISH","indicator":"MACD","name":"Bullish Crossover","strength":3,"detail":"MACD crossed above signal — strong buy"})
+        elif cd:        sigs.append({"type":"BEARISH","indicator":"MACD","name":"Bearish Crossover","strength":3,"detail":"MACD crossed below signal — strong sell"})
+        elif macd>msig: sigs.append({"type":"BULLISH","indicator":"MACD","name":"Positive","strength":1,"detail":"MACD above signal"})
+        else:           sigs.append({"type":"BEARISH","indicator":"MACD","name":"Negative","strength":1,"detail":"MACD below signal"})
 
-        # Max drawdown
-        cum = (1 + daily_returns).cumprod()
-        rolling_max = cum.cummax()
-        dd_series = (cum - rolling_max) / rolling_max
-        max_dd = float(dd_series.min())
+    s20,s50,s200 = _s("SMA20"),_s("SMA50"),_s("SMA200")
+    ps50,ps200 = _s("SMA50",prv),_s("SMA200",prv)
+    if s50 and s200 and ps50 and ps200:
+        if s50>s200 and ps50<=ps200:   sigs.append({"type":"BULLISH","indicator":"MA","name":"Golden Cross","strength":3,"detail":"SMA50 crossed above SMA200"})
+        elif s50<s200 and ps50>=ps200: sigs.append({"type":"BEARISH","indicator":"MA","name":"Death Cross","strength":3,"detail":"SMA50 crossed below SMA200"})
+        elif s50>s200: sigs.append({"type":"BULLISH","indicator":"MA","name":"Above SMA200","strength":2,"detail":"Long-term uptrend intact"})
+        else:          sigs.append({"type":"BEARISH","indicator":"MA","name":"Below SMA200","strength":2,"detail":"Long-term downtrend"})
+    if s20 and s50:
+        if price>s20 and price>s50:   sigs.append({"type":"BULLISH","indicator":"MA","name":"Above SMA20/50","strength":2,"detail":"Price above short-term MAs"})
+        elif price<s20 and price<s50: sigs.append({"type":"BEARISH","indicator":"MA","name":"Below SMA20/50","strength":2,"detail":"Price below short-term MAs"})
 
-        # Calmar ratio
-        calmar = float(cagr / abs(max_dd)) if max_dd != 0 else 0.0
+    bbu,bbm,bbl = _s("BB_upper"),_s("BB_middle"),_s("BB_lower")
+    if bbu and bbl and bbm:
+        bw = (bbu-bbl)/bbm
+        if price<bbl:    sigs.append({"type":"BULLISH","indicator":"BB","name":"Below Lower Band","strength":3,"detail":"Potential mean reversion upward"})
+        elif price>bbu:  sigs.append({"type":"BEARISH","indicator":"BB","name":"Above Upper Band","strength":3,"detail":"Potential mean reversion downward"})
+        elif bw<0.08:    sigs.append({"type":"NEUTRAL","indicator":"BB","name":"BB Squeeze","strength":1,"detail":"Breakout incoming"})
+        else:
+            pctb = (price-bbl)/(bbu-bbl)
+            if pctb<0.35:  sigs.append({"type":"BULLISH","indicator":"BB","name":"Lower Half BB","strength":1,"detail":f"{pctb*100:.0f}%B"})
+            elif pctb>0.65:sigs.append({"type":"BEARISH","indicator":"BB","name":"Upper Half BB","strength":1,"detail":f"{pctb*100:.0f}%B"})
 
-        # VaR 95% & CVaR 95%
-        var_95 = float(np.percentile(daily_returns, 5))
-        cvar_95 = float(daily_returns[daily_returns <= var_95].mean()) if len(daily_returns[daily_returns <= var_95]) > 0 else var_95
+    avg_vol = hist["Volume"].rolling(20).mean().iloc[-1]
+    cur_vol = float(lat["Volume"]); chg = float(lat["Close"])-float(prv["Close"])
+    if not np.isnan(avg_vol) and cur_vol > avg_vol*1.5:
+        ratio = cur_vol/avg_vol
+        if chg>0: sigs.append({"type":"BULLISH","indicator":"Volume","name":"High-Volume Rally","strength":2,"detail":f"Volume {ratio:.1f}x avg on up day"})
+        else:     sigs.append({"type":"BEARISH","indicator":"Volume","name":"High-Volume Selloff","strength":2,"detail":f"Volume {ratio:.1f}x avg on down day"})
 
-        # Win rate & profit factor
-        wins = daily_returns[daily_returns > 0]
-        losses = daily_returns[daily_returns < 0]
-        win_rate = float(len(wins) / n_days)
-        profit_factor = float(wins.sum() / abs(losses.sum())) if losses.sum() != 0 else 999.0
+    sk,sd = _s("Stoch_K"),_s("Stoch_D")
+    if sk is not None and sd is not None:
+        pk,pd_ = _s("Stoch_K",prv),_s("Stoch_D",prv)
+        if sk<20:   sigs.append({"type":"BULLISH","indicator":"Stoch","name":"Stoch Oversold","strength":2,"detail":f"K={sk:.1f}"})
+        elif sk>80: sigs.append({"type":"BEARISH","indicator":"Stoch","name":"Stoch Overbought","strength":2,"detail":f"K={sk:.1f}"})
+        if pk and pd_:
+            if sk>sd and pk<=pd_ and sk<80: sigs.append({"type":"BULLISH","indicator":"Stoch","name":"Stoch Bullish Cross","strength":2,"detail":"K crossed above D"})
+            elif sk<sd and pk>=pd_ and sk>20: sigs.append({"type":"BEARISH","indicator":"Stoch","name":"Stoch Bearish Cross","strength":2,"detail":"K crossed below D"})
 
-        # Skewness & kurtosis (positive skew better for longs)
-        skewness = float(daily_returns.skew())
-        kurt = float(daily_returns.kurt())
-
-        # Monthly returns for consistency
-        monthly = hist["Close"].resample("ME").last().pct_change().dropna()
-        pos_months = int((monthly > 0).sum())
-        total_months = int(len(monthly))
-
-        return {
-            "return_1y": round(cagr, 4),
-            "total_return": round(total_ret, 4),
-            "annualized_volatility": round(ann_vol, 4),
-            "sharpe_ratio": round(sharpe, 3),
-            "sortino_ratio": round(sortino, 3),
-            "calmar_ratio": round(calmar, 3),
-            "max_drawdown": round(max_dd, 4),
-            "var_95": round(var_95, 4),
-            "cvar_95": round(cvar_95, 4),
-            "win_rate": round(win_rate, 4),
-            "profit_factor": round(min(profit_factor, 99.0), 3),
-            "skewness": round(skewness, 3),
-            "kurtosis": round(kurt, 3),
-            "positive_months": pos_months,
-            "total_months": total_months,
-        }
-    except Exception as e:
-        print(f"Performance metrics error: {e}")
-        return {}
+    return sigs
 
 
-def calculate_benchmark_comparison(hist: pd.DataFrame, symbol: str, bench_sym: str = "SPY") -> Dict:
-    """Beta, alpha, tracking error, R², information ratio vs benchmark."""
-    if symbol == bench_sym:
-        return {}
-    try:
-        bench_ticker = yf.Ticker(bench_sym, session=_session)
-        bench = bench_ticker.history(period="1y", auto_adjust=True)
-        if bench.empty:
-            return {}
-        bench.index = bench.index.tz_localize(None) if bench.index.tz else bench.index
-
-        common = hist.index.intersection(bench.index)
-        if len(common) < 60:
-            return {}
-
-        etf_r = hist.loc[common, "Close"].pct_change().dropna()
-        bench_r = bench.loc[common, "Close"].pct_change().dropna()
-        idx = etf_r.index.intersection(bench_r.index)
-        etf_r, bench_r = etf_r.loc[idx], bench_r.loc[idx]
-
-        # Beta
-        cov_matrix = np.cov(etf_r, bench_r)
-        beta = float(cov_matrix[0, 1] / cov_matrix[1, 1]) if cov_matrix[1, 1] > 0 else 1.0
-
-        # Jensen's alpha (annualized)
-        rf_daily = 0.053 / 252
-        alpha_daily = (etf_r.mean() - rf_daily) - beta * (bench_r.mean() - rf_daily)
-        alpha_ann = float(alpha_daily * 252)
-
-        # Correlation & R²
-        corr = float(etf_r.corr(bench_r))
-        r2 = round(corr ** 2, 4)
-
-        # Tracking error & information ratio
-        diff = etf_r - bench_r
-        te = float(diff.std() * np.sqrt(252))
-        ir = float((diff.mean() * 252) / te) if te > 0 else 0.0
-
-        # 1-year cumulative returns
-        etf_cum = float((etf_r + 1).prod() - 1)
-        bench_cum = float((bench_r + 1).prod() - 1)
-
-        # Up/Down capture ratios
-        up_days = bench_r[bench_r > 0]
-        dn_days = bench_r[bench_r < 0]
-        up_capture = float((etf_r[up_days.index].mean() / up_days.mean()) * 100) if len(up_days) > 0 and up_days.mean() != 0 else 100.0
-        dn_capture = float((etf_r[dn_days.index].mean() / dn_days.mean()) * 100) if len(dn_days) > 0 and dn_days.mean() != 0 else 100.0
-
-        return {
-            "benchmark": bench_sym,
-            "beta": round(beta, 3),
-            "alpha_annualized": round(alpha_ann, 4),
-            "correlation": round(corr, 3),
-            "r_squared": r2,
-            "tracking_error": round(te, 4),
-            "information_ratio": round(ir, 3),
-            "etf_return_1y": round(etf_cum, 4),
-            "benchmark_return_1y": round(bench_cum, 4),
-            "relative_performance": round(etf_cum - bench_cum, 4),
-            "up_capture": round(up_capture, 1),
-            "down_capture": round(dn_capture, 1),
-        }
-    except Exception as e:
-        print(f"Benchmark comparison error: {e}")
-        return {}
+def get_recommendation(signals, fscore):
+    bull = sum(s["strength"] for s in signals if s["type"]=="BULLISH")
+    bear = sum(s["strength"] for s in signals if s["type"]=="BEARISH")
+    ts = (bull/(bull+bear)*100) if (bull+bear) else 50.0
+    cs = ts*0.5 + fscore*100*0.5
+    if cs>=72:   act,lbl = "BUY","Strong Buy"
+    elif cs>=60: act,lbl = "ACCUMULATE","Accumulate"
+    elif cs>=45: act,lbl = "HOLD","Hold / Watch"
+    elif cs>=33: act,lbl = "REDUCE","Reduce"
+    else:        act,lbl = "SELL","Sell / Avoid"
+    return {"action":act,"label":lbl,
+            "confidence":min(95,int(abs(cs-50)*2+50)),
+            "technical_score":round(ts,1),"fundamental_score":round(fscore*100,1),
+            "combined_score":round(cs,1),
+            "bullish_count":len([s for s in signals if s["type"]=="BULLISH"]),
+            "bearish_count":len([s for s in signals if s["type"]=="BEARISH"]),
+            "neutral_count":len([s for s in signals if s["type"]=="NEUTRAL"])}
 
 
-def get_etf_holdings(ticker: yf.Ticker) -> Dict:
-    """Fetch top holdings, sector weights, asset classes from funds_data."""
-    result: Dict[str, Any] = {
-        "top_holdings": [],
-        "sector_weightings": {},
-        "asset_classes": {},
-        "equity_holdings": {},
-        "bond_holdings": {},
-    }
-    try:
-        fd = ticker.funds_data
-        if fd is None:
-            return result
-
-        # Top holdings
-        try:
-            th = fd.top_holdings
-            if th is not None and not th.empty:
-                result["top_holdings"] = [
-                    {
-                        "symbol": str(row.get("Symbol", idx)),
-                        "name": str(row.get("Name", row.get("Holding", idx))),
-                        "weight": round(float(row.get("% Assets", row.get("Percent Assets", 0))) , 4),
-                    }
-                    for idx, row in th.iterrows()
-                ][:15]
-        except Exception:
-            pass
-
-        # Sector weights
-        try:
-            sw = fd.sector_weightings
-            if sw:
-                result["sector_weightings"] = {k: round(float(v), 4) for k, v in sw.items() if v}
-        except Exception:
-            pass
-
-        # Asset classes
-        try:
-            ac = fd.asset_classes
-            if ac:
-                result["asset_classes"] = {k: round(float(v), 4) for k, v in ac.items() if v}
-        except Exception:
-            pass
-
-        # Equity holdings aggregate metrics
-        try:
-            eh = fd.equity_holdings
-            if eh is not None and not eh.empty:
-                row = eh.iloc[0] if len(eh) > 0 else None
-                if row is not None:
-                    result["equity_holdings"] = {k: v for k, v in row.items() if v is not None and not (isinstance(v, float) and np.isnan(v))}
-        except Exception:
-            pass
-
-        # Bond holdings
-        try:
-            bh = fd.bond_holdings
-            if bh is not None and not bh.empty:
-                row = bh.iloc[0] if len(bh) > 0 else None
-                if row is not None:
-                    result["bond_holdings"] = {k: v for k, v in row.items() if v is not None and not (isinstance(v, float) and np.isnan(v))}
-        except Exception:
-            pass
-
-    except Exception as e:
-        print(f"ETF holdings error: {e}")
-    return result
-
-
-# ─── Scoring ──────────────────────────────────────────────────────────────────
-
-def etf_fundamental_score(info: Dict, perf: Dict, bench: Dict) -> float:
-    scores = []
-
-    # 1. Expense ratio (25% weight — lower is always better)
-    er = info.get("annualReportExpenseRatio") or info.get("expenseRatio") or 0
-    if er and er > 0:
-        if er < 0.0005: scores.extend([1.0, 1.0])    # < 0.05% (index funds)
-        elif er < 0.001: scores.extend([0.95, 0.95])  # 0.05-0.1%
-        elif er < 0.002: scores.extend([0.85, 0.85])  # 0.1-0.2%
-        elif er < 0.005: scores.extend([0.70, 0.70])  # 0.2-0.5%
-        elif er < 0.010: scores.extend([0.50, 0.50])  # 0.5-1%
-        else: scores.extend([0.20, 0.20])
-
-    # 2. AUM (20% weight — liquidity + stability)
-    aum = info.get("totalAssets")
-    if aum:
-        if aum > 50e9: scores.extend([1.0, 1.0])
-        elif aum > 10e9: scores.extend([0.9, 0.9])
-        elif aum > 1e9: scores.extend([0.75, 0.75])
-        elif aum > 100e6: scores.extend([0.55, 0.55])
-        elif aum > 10e6: scores.extend([0.35, 0.35])
-        else: scores.extend([0.15, 0.15])
-
-    # 3. Sharpe ratio (25% weight)
-    sharpe = perf.get("sharpe_ratio")
-    if sharpe is not None:
-        if sharpe > 2.0: scores.extend([1.0, 1.0, 1.0])
-        elif sharpe > 1.5: scores.extend([0.85, 0.85, 0.85])
-        elif sharpe > 1.0: scores.extend([0.70, 0.70, 0.70])
-        elif sharpe > 0.5: scores.extend([0.55, 0.55, 0.55])
-        elif sharpe > 0: scores.extend([0.40, 0.40, 0.40])
-        else: scores.extend([0.15, 0.15, 0.15])
-
-    # 4. Max drawdown (15% weight)
-    max_dd = perf.get("max_drawdown")
-    if max_dd is not None:
-        dd = abs(max_dd)
-        if dd < 0.05: scores.extend([1.0, 1.0])
-        elif dd < 0.10: scores.extend([0.85, 0.85])
-        elif dd < 0.15: scores.extend([0.75, 0.75])
-        elif dd < 0.20: scores.extend([0.60, 0.60])
-        elif dd < 0.30: scores.extend([0.45, 0.45])
-        elif dd < 0.40: scores.extend([0.30, 0.30])
-        else: scores.extend([0.10, 0.10])
-
-    # 5. 1Y return vs risk-free (15% weight)
-    ret_1y = perf.get("return_1y") or info.get("ytdReturn")
-    if ret_1y is not None:
-        if ret_1y > 0.30: scores.extend([0.95, 0.95])
-        elif ret_1y > 0.15: scores.extend([0.80, 0.80])
-        elif ret_1y > 0.05: scores.extend([0.65, 0.65])
-        elif ret_1y > 0: scores.extend([0.50, 0.50])
-        else: scores.extend([0.25, 0.25])
-
-    # 6. Sortino ratio bonus
-    sortino = perf.get("sortino_ratio")
-    if sortino is not None:
-        if sortino > 2.0: scores.append(1.0)
-        elif sortino > 1.0: scores.append(0.75)
-        elif sortino > 0: scores.append(0.5)
-        else: scores.append(0.2)
-
-    # 7. Calmar ratio bonus
-    calmar = perf.get("calmar_ratio")
-    if calmar is not None:
-        if calmar > 2.0: scores.append(1.0)
-        elif calmar > 1.0: scores.append(0.75)
-        elif calmar > 0.5: scores.append(0.55)
-        elif calmar > 0: scores.append(0.35)
-        else: scores.append(0.15)
-
-    # 8. Alpha (positive alpha = outperforming benchmark)
-    alpha = bench.get("alpha_annualized")
-    if alpha is not None:
-        if alpha > 0.05: scores.append(0.9)
-        elif alpha > 0: scores.append(0.65)
-        elif alpha > -0.05: scores.append(0.45)
-        else: scores.append(0.2)
-
-    # 9. Up/Down capture (>100 up, <100 down = ideal)
-    up_cap = bench.get("up_capture")
-    dn_cap = bench.get("down_capture")
-    if up_cap is not None and dn_cap is not None:
-        capture_ratio = (up_cap / dn_cap) if dn_cap > 0 else 1.0
-        if capture_ratio > 1.2: scores.append(0.9)
-        elif capture_ratio > 1.0: scores.append(0.7)
-        elif capture_ratio > 0.8: scores.append(0.5)
-        else: scores.append(0.3)
-
-    return sum(scores) / len(scores) if scores else 0.5
-
-
-def stock_fundamental_score(info: Dict) -> float:
+def stock_fscore(info):
     scores = []
     pe = info.get("trailingPE") or info.get("forwardPE")
-    if pe and 0 < pe < 200:
-        if pe < 15: scores.append(0.9)
-        elif pe < 25: scores.append(0.7)
-        elif pe < 40: scores.append(0.5)
-        elif pe < 60: scores.append(0.3)
-        else: scores.append(0.1)
-    for key, thresholds in [
-        ("revenueGrowth", [(0.25, 0.9), (0.15, 0.75), (0.05, 0.55), (0.0, 0.4)]),
-        ("earningsGrowth", [(0.25, 0.9), (0.10, 0.7), (0.0, 0.5)]),
-        ("profitMargins", [(0.25, 0.9), (0.15, 0.75), (0.05, 0.55), (0.0, 0.35)]),
+    if pe and 0<pe<200:
+        scores.append(0.9 if pe<15 else 0.7 if pe<25 else 0.5 if pe<40 else 0.3 if pe<60 else 0.1)
+    for key,thresholds in [
+        ("revenueGrowth",[(0.25,0.9),(0.15,0.75),(0.05,0.55),(0.0,0.4)]),
+        ("earningsGrowth",[(0.25,0.9),(0.10,0.7),(0.0,0.5)]),
+        ("profitMargins",[(0.25,0.9),(0.15,0.75),(0.05,0.55),(0.0,0.35)]),
     ]:
         v = info.get(key)
         if v is not None:
-            for thresh, sc in thresholds:
-                if v >= thresh:
-                    scores.append(sc)
-                    break
-            else:
-                scores.append(0.15)
+            for thresh,sc in thresholds:
+                if v>=thresh: scores.append(sc); break
+            else: scores.append(0.15)
     de = info.get("debtToEquity")
-    if de is not None:
-        scores.append(0.9 if de < 30 else 0.7 if de < 80 else 0.5 if de < 150 else 0.2)
+    if de is not None: scores.append(0.9 if de<30 else 0.7 if de<80 else 0.5 if de<150 else 0.2)
     rec = info.get("recommendationMean")
-    if rec is not None and 1 <= rec <= 5:
-        scores.append(max(0.0, (5 - rec) / 4))
+    if rec and 1<=rec<=5: scores.append(max(0.0,(5-rec)/4))
     cr = info.get("currentRatio")
-    if cr is not None:
-        scores.append(0.9 if cr > 2 else 0.7 if cr > 1.5 else 0.5 if cr > 1 else 0.2)
-    return sum(scores) / len(scores) if scores else 0.5
+    if cr: scores.append(0.9 if cr>2 else 0.7 if cr>1.5 else 0.5 if cr>1 else 0.2)
+    return sum(scores)/len(scores) if scores else 0.5
 
 
-# ─── Signal Generation ────────────────────────────────────────────────────────
-
-def generate_signals(hist: pd.DataFrame) -> List[Dict]:
-    signals = []
-    if len(hist) < 2:
-        return signals
-
-    latest = hist.iloc[-1]
-    prev = hist.iloc[-2]
-    price = float(latest["Close"])
-
-    def _safe(col):
-        v = latest.get(col)
-        return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
-
-    def _safep(col):
-        v = prev.get(col)
-        return None if (v is None or (isinstance(v, float) and np.isnan(v))) else float(v)
-
-    rsi = _safe("RSI")
-    if rsi is not None:
-        if rsi < 30:
-            signals.append({"type": "BULLISH", "indicator": "RSI", "name": "Oversold", "strength": 3,
-                            "detail": f"RSI={rsi:.1f} — deeply oversold; potential reversal"})
-        elif rsi > 70:
-            signals.append({"type": "BEARISH", "indicator": "RSI", "name": "Overbought", "strength": 3,
-                            "detail": f"RSI={rsi:.1f} — overbought; possible pullback"})
-        elif rsi < 40:
-            signals.append({"type": "BULLISH", "indicator": "RSI", "name": "Near Oversold", "strength": 1,
-                            "detail": f"RSI={rsi:.1f} — approaching oversold zone"})
-        elif rsi > 60:
-            signals.append({"type": "BEARISH", "indicator": "RSI", "name": "Near Overbought", "strength": 1,
-                            "detail": f"RSI={rsi:.1f} — approaching overbought zone"})
-        else:
-            signals.append({"type": "NEUTRAL", "indicator": "RSI", "name": "Neutral", "strength": 0,
-                            "detail": f"RSI={rsi:.1f} — neutral momentum"})
-
-    macd = _safe("MACD"); macd_sig = _safe("MACD_signal")
-    prev_macd = _safep("MACD"); prev_macd_sig = _safep("MACD_signal")
-    if macd is not None and macd_sig is not None:
-        cross_up = macd > macd_sig and (prev_macd is None or prev_macd <= prev_macd_sig)
-        cross_dn = macd < macd_sig and (prev_macd is None or prev_macd >= prev_macd_sig)
-        if cross_up:
-            signals.append({"type": "BULLISH", "indicator": "MACD", "name": "Bullish Crossover", "strength": 3,
-                            "detail": "MACD crossed above signal — strong buy signal"})
-        elif cross_dn:
-            signals.append({"type": "BEARISH", "indicator": "MACD", "name": "Bearish Crossover", "strength": 3,
-                            "detail": "MACD crossed below signal — strong sell signal"})
-        elif macd > macd_sig:
-            signals.append({"type": "BULLISH", "indicator": "MACD", "name": "Positive", "strength": 1,
-                            "detail": "MACD above signal — bullish momentum"})
-        else:
-            signals.append({"type": "BEARISH", "indicator": "MACD", "name": "Negative", "strength": 1,
-                            "detail": "MACD below signal — bearish momentum"})
-
-    sma20 = _safe("SMA20"); sma50 = _safe("SMA50"); sma200 = _safe("SMA200")
-    prev_sma50 = _safep("SMA50"); prev_sma200 = _safep("SMA200")
-    if sma50 and sma200 and prev_sma50 and prev_sma200:
-        if sma50 > sma200 and prev_sma50 <= prev_sma200:
-            signals.append({"type": "BULLISH", "indicator": "MA", "name": "Golden Cross", "strength": 3,
-                            "detail": "SMA50 crossed above SMA200 — major bullish signal"})
-        elif sma50 < sma200 and prev_sma50 >= prev_sma200:
-            signals.append({"type": "BEARISH", "indicator": "MA", "name": "Death Cross", "strength": 3,
-                            "detail": "SMA50 crossed below SMA200 — major bearish signal"})
-        elif sma50 > sma200:
-            signals.append({"type": "BULLISH", "indicator": "MA", "name": "Above SMA200", "strength": 2,
-                            "detail": "SMA50 > SMA200 — long-term uptrend intact"})
-        else:
-            signals.append({"type": "BEARISH", "indicator": "MA", "name": "Below SMA200", "strength": 2,
-                            "detail": "SMA50 < SMA200 — long-term downtrend"})
-
-    if sma20 and sma50:
-        if price > sma20 and price > sma50:
-            signals.append({"type": "BULLISH", "indicator": "MA", "name": "Above SMA20/50", "strength": 2,
-                            "detail": "Price above SMA20 and SMA50 — short-term uptrend"})
-        elif price < sma20 and price < sma50:
-            signals.append({"type": "BEARISH", "indicator": "MA", "name": "Below SMA20/50", "strength": 2,
-                            "detail": "Price below SMA20 and SMA50 — short-term downtrend"})
-
-    bb_u = _safe("BB_upper"); bb_l = _safe("BB_lower"); bb_m = _safe("BB_middle")
-    if bb_u and bb_l and bb_m:
-        bw = (bb_u - bb_l) / bb_m
-        if price < bb_l:
-            signals.append({"type": "BULLISH", "indicator": "BB", "name": "Below Lower Band", "strength": 3,
-                            "detail": "Price below lower Bollinger Band — mean reversion likely upward"})
-        elif price > bb_u:
-            signals.append({"type": "BEARISH", "indicator": "BB", "name": "Above Upper Band", "strength": 3,
-                            "detail": "Price above upper Bollinger Band — mean reversion likely downward"})
-        elif bw < 0.08:
-            signals.append({"type": "NEUTRAL", "indicator": "BB", "name": "BB Squeeze", "strength": 1,
-                            "detail": "Bollinger Band squeeze — breakout incoming"})
-        else:
-            pct_b = (price - bb_l) / (bb_u - bb_l)
-            if pct_b < 0.35:
-                signals.append({"type": "BULLISH", "indicator": "BB", "name": "Lower Half BB", "strength": 1,
-                                "detail": f"Price in lower half of Bollinger Bands ({pct_b*100:.0f}%B)"})
-            elif pct_b > 0.65:
-                signals.append({"type": "BEARISH", "indicator": "BB", "name": "Upper Half BB", "strength": 1,
-                                "detail": f"Price in upper half of Bollinger Bands ({pct_b*100:.0f}%B)"})
-
-    avg_vol = hist["Volume"].rolling(20).mean().iloc[-1]
-    curr_vol = float(latest["Volume"])
-    price_chg = float(latest["Close"]) - float(prev["Close"])
-    if not np.isnan(avg_vol) and curr_vol > avg_vol * 1.5:
-        ratio = curr_vol / avg_vol
-        if price_chg > 0:
-            signals.append({"type": "BULLISH", "indicator": "Volume", "name": "High-Volume Rally", "strength": 2,
-                            "detail": f"Volume {ratio:.1f}x avg on up day — strong buying conviction"})
-        else:
-            signals.append({"type": "BEARISH", "indicator": "Volume", "name": "High-Volume Selloff", "strength": 2,
-                            "detail": f"Volume {ratio:.1f}x avg on down day — strong selling pressure"})
-
-    stoch_k = _safe("Stoch_K"); stoch_d = _safe("Stoch_D")
-    if stoch_k is not None and stoch_d is not None:
-        prev_k = _safep("Stoch_K"); prev_d = _safep("Stoch_D")
-        if stoch_k < 20:
-            signals.append({"type": "BULLISH", "indicator": "Stoch", "name": "Stoch Oversold", "strength": 2,
-                            "detail": f"Stochastic K={stoch_k:.1f} — oversold"})
-        elif stoch_k > 80:
-            signals.append({"type": "BEARISH", "indicator": "Stoch", "name": "Stoch Overbought", "strength": 2,
-                            "detail": f"Stochastic K={stoch_k:.1f} — overbought"})
-        if prev_k and prev_d:
-            if stoch_k > stoch_d and prev_k <= prev_d and stoch_k < 80:
-                signals.append({"type": "BULLISH", "indicator": "Stoch", "name": "Stoch Bullish Cross", "strength": 2,
-                                "detail": "Stochastic K crossed above D — bullish"})
-            elif stoch_k < stoch_d and prev_k >= prev_d and stoch_k > 20:
-                signals.append({"type": "BEARISH", "indicator": "Stoch", "name": "Stoch Bearish Cross", "strength": 2,
-                                "detail": "Stochastic K crossed below D — bearish"})
-
-    return signals
-
-
-def get_recommendation(signals: List[Dict], fundamental_score: float = 0.5) -> Dict:
-    bull = sum(s["strength"] for s in signals if s["type"] == "BULLISH")
-    bear = sum(s["strength"] for s in signals if s["type"] == "BEARISH")
-    total = bull + bear
-    tech_score = (bull / total * 100) if total > 0 else 50.0
-    combined = tech_score * 0.5 + fundamental_score * 100 * 0.5
-
-    if combined >= 72:   action, label = "BUY",        "Strong Buy"
-    elif combined >= 60: action, label = "ACCUMULATE", "Accumulate"
-    elif combined >= 45: action, label = "HOLD",       "Hold / Watch"
-    elif combined >= 33: action, label = "REDUCE",     "Reduce"
-    else:                action, label = "SELL",        "Sell / Avoid"
-
-    return {
-        "action": action, "label": label,
-        "confidence": min(95, int(abs(combined - 50) * 2 + 50)),
-        "technical_score": round(tech_score, 1),
-        "fundamental_score": round(fundamental_score * 100, 1),
-        "combined_score": round(combined, 1),
-        "bullish_count": len([s for s in signals if s["type"] == "BULLISH"]),
-        "bearish_count": len([s for s in signals if s["type"] == "BEARISH"]),
-        "neutral_count": len([s for s in signals if s["type"] == "NEUTRAL"]),
-    }
-
-
-# ─── AI Analysis ─────────────────────────────────────────────────────────────
-
-def get_ai_analysis(symbol: str, info: Dict, hist: pd.DataFrame, signals: List[Dict],
-                    rec: Dict, is_etf: bool = False, etf_data: Dict = None) -> Optional[Dict]:
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key or not ANTHROPIC_AVAILABLE:
-        return None
+def calc_perf(hist):
+    if len(hist)<30: return {}
     try:
-        client = anthropic.Anthropic(api_key=api_key)
+        dr = hist["Close"].pct_change().dropna()
+        years = len(dr)/252
+        total_ret = float(hist["Close"].iloc[-1]/hist["Close"].iloc[0])-1
+        cagr = float((1+total_ret)**(1/years)-1) if years>0 else 0.0
+        ann_vol = float(dr.std()*np.sqrt(252))
+        rf = 0.053/252
+        ex = dr-rf
+        sharpe = float((ex.mean()/ex.std())*np.sqrt(252)) if ex.std()>0 else 0.0
+        neg = dr[dr<rf]; dn_std = float(neg.std()*np.sqrt(252)) if len(neg)>5 else ann_vol
+        sortino = float((cagr-0.053)/dn_std) if dn_std>0 else 0.0
+        cum = (1+dr).cumprod(); dd = (cum-cum.cummax())/cum.cummax()
+        max_dd = float(dd.min())
+        calmar = float(cagr/abs(max_dd)) if max_dd!=0 else 0.0
+        var95 = float(np.percentile(dr,5))
+        cvar95 = float(dr[dr<=var95].mean()) if len(dr[dr<=var95])>0 else var95
+        win_rate = float((dr>0).sum()/len(dr))
+        wins = dr[dr>0]; losses = dr[dr<0]
+        pf = float(wins.sum()/abs(losses.sum())) if losses.sum()!=0 else 99.0
+        monthly = hist["Close"].resample("ME").last().pct_change().dropna()
+        return {"return_1y":round(cagr,4),"total_return":round(total_ret,4),
+                "annualized_volatility":round(ann_vol,4),"sharpe_ratio":round(sharpe,3),
+                "sortino_ratio":round(sortino,3),"calmar_ratio":round(calmar,3),
+                "max_drawdown":round(max_dd,4),"var_95":round(var95,4),"cvar_95":round(cvar95,4),
+                "win_rate":round(win_rate,4),"profit_factor":round(min(pf,99.0),3),
+                "skewness":round(float(dr.skew()),3),"kurtosis":round(float(dr.kurt()),3),
+                "positive_months":int((monthly>0).sum()),"total_months":int(len(monthly))}
+    except Exception as e:
+        print(f"Perf metrics error: {e}"); return {}
+
+
+def calc_bench(hist, symbol, bench_sym="SPY"):
+    if symbol==bench_sym: return {}
+    try:
+        bench_hist = _yf.get_history(bench_sym)
+        if bench_hist.empty: return {}
+        common = hist.index.intersection(bench_hist.index)
+        if len(common)<60: return {}
+        er = hist.loc[common,"Close"].pct_change().dropna()
+        br = bench_hist.loc[common,"Close"].pct_change().dropna()
+        idx = er.index.intersection(br.index)
+        er,br = er.loc[idx],br.loc[idx]
+        cov = np.cov(er,br); bv = cov[1,1]
+        beta = float(cov[0,1]/bv) if bv>0 else 1.0
+        rf = 0.053/252
+        alpha = ((er.mean()-rf)-beta*(br.mean()-rf))*252
+        corr = float(er.corr(br)); te = float((er-br).std()*np.sqrt(252))
+        ir = float(((er-br).mean()*252)/te) if te>0 else 0.0
+        up_days = br[br>0]; dn_days = br[br<0]
+        uc = float((er[up_days.index].mean()/up_days.mean())*100) if len(up_days)>0 and up_days.mean()!=0 else 100.0
+        dc = float((er[dn_days.index].mean()/dn_days.mean())*100) if len(dn_days)>0 and dn_days.mean()!=0 else 100.0
+        return {"benchmark":bench_sym,"beta":round(beta,3),"alpha_annualized":round(float(alpha),4),
+                "correlation":round(corr,3),"r_squared":round(corr**2,4),"tracking_error":round(te,4),
+                "information_ratio":round(ir,3),"etf_return_1y":round(float((er+1).prod()-1),4),
+                "benchmark_return_1y":round(float((br+1).prod()-1),4),
+                "relative_performance":round(float((er+1).prod()-(br+1).prod()),4),
+                "up_capture":round(uc,1),"down_capture":round(dc,1)}
+    except Exception as e:
+        print(f"Bench error: {e}"); return {}
+
+
+def etf_fscore(info, perf, bench):
+    scores = []
+    er = info.get("annualReportExpenseRatio") or info.get("expenseRatio") or 0
+    if er and er>0:
+        s = 1.0 if er<0.0005 else 0.95 if er<0.001 else 0.85 if er<0.002 else 0.70 if er<0.005 else 0.50 if er<0.010 else 0.20
+        scores.extend([s,s])
+    aum = info.get("totalAssets")
+    if aum:
+        s = 1.0 if aum>50e9 else 0.9 if aum>10e9 else 0.75 if aum>1e9 else 0.55 if aum>100e6 else 0.35 if aum>10e6 else 0.15
+        scores.extend([s,s])
+    sharpe = perf.get("sharpe_ratio")
+    if sharpe is not None:
+        s = 1.0 if sharpe>2 else 0.85 if sharpe>1.5 else 0.70 if sharpe>1 else 0.55 if sharpe>0.5 else 0.40 if sharpe>0 else 0.15
+        scores.extend([s,s,s])
+    mdd = perf.get("max_drawdown")
+    if mdd is not None:
+        dd = abs(mdd)
+        s = 1.0 if dd<0.05 else 0.85 if dd<0.10 else 0.75 if dd<0.15 else 0.60 if dd<0.20 else 0.45 if dd<0.30 else 0.30 if dd<0.40 else 0.10
+        scores.extend([s,s])
+    ret = perf.get("return_1y") or info.get("ytdReturn")
+    if ret is not None:
+        s = 0.95 if ret>0.30 else 0.80 if ret>0.15 else 0.65 if ret>0.05 else 0.50 if ret>0 else 0.25
+        scores.extend([s,s])
+    for k,thresholds in [("sortino_ratio",[(2,1.0),(1,0.75),(0,0.5)]),("calmar_ratio",[(2,1.0),(1,0.75),(0.5,0.55),(0,0.35)])]:
+        v = perf.get(k)
+        if v is not None:
+            for t,sc in thresholds:
+                if v>=t: scores.append(sc); break
+            else: scores.append(0.15)
+    alpha = bench.get("alpha_annualized")
+    if alpha is not None: scores.append(0.9 if alpha>0.05 else 0.65 if alpha>0 else 0.45 if alpha>-0.05 else 0.2)
+    uc,dc = bench.get("up_capture"),bench.get("down_capture")
+    if uc and dc:
+        cr = uc/dc if dc>0 else 1
+        scores.append(0.9 if cr>1.2 else 0.7 if cr>1 else 0.5 if cr>0.8 else 0.3)
+    return sum(scores)/len(scores) if scores else 0.5
+
+
+def get_ai_analysis(symbol, info, hist, signals, rec, is_etf=False, etf_data=None):
+    key = os.environ.get("ANTHROPIC_API_KEY")
+    if not key or not ANTHROPIC_AVAILABLE: return None
+    try:
+        client = anthropic.Anthropic(api_key=key)
         price = float(hist["Close"].iloc[-1])
-        rsi_val = hist["RSI"].iloc[-1]
-        rsi_str = f"{rsi_val:.1f}" if not pd.isna(rsi_val) else "N/A"
-        sma50 = float(hist["SMA50"].iloc[-1]) if not pd.isna(hist["SMA50"].iloc[-1]) else None
-        sma200 = float(hist["SMA200"].iloc[-1]) if not pd.isna(hist["SMA200"].iloc[-1]) else None
+        rsi_v = hist["RSI"].iloc[-1]
+        rsi_s = f"{rsi_v:.1f}" if not pd.isna(rsi_v) else "N/A"
+        s50 = float(hist["SMA50"].iloc[-1]) if not pd.isna(hist["SMA50"].iloc[-1]) else None
+        s200 = float(hist["SMA200"].iloc[-1]) if not pd.isna(hist["SMA200"].iloc[-1]) else None
 
         if is_etf and etf_data:
-            perf = etf_data.get("performance_metrics", {})
-            bench = etf_data.get("benchmark_comparison", {})
-            prompt = f"""You are a senior ETF strategist. Analyze {symbol} ({info.get('longName', symbol)}).
+            p,b = etf_data.get("performance_metrics",{}),etf_data.get("benchmark_comparison",{})
+            prompt = f"""You are a senior ETF strategist. Analyze {symbol} ({info.get('longName',symbol)}).
 
-ETF Overview:
-- Category: {info.get('category', 'N/A')}, Fund Family: {info.get('fundFamily', 'N/A')}
-- AUM: ${info.get('totalAssets', 0)/1e9:.1f}B, Expense Ratio: {(info.get('annualReportExpenseRatio') or info.get('expenseRatio') or 0)*100:.2f}%
-- Distribution Yield: {(info.get('yield') or 0)*100:.2f}%
-
-Technical:
-- Price: ${price:.2f}, RSI(14): {rsi_str}
-- vs SMA50: {"Above" if sma50 and price > sma50 else "Below"}, vs SMA200: {"Above" if sma200 and price > sma200 else "Below"}
-- Technical Score: {rec['technical_score']}/100
-
-Performance (1Y):
-- CAGR: {perf.get('return_1y', 0)*100:.1f}%, Sharpe: {perf.get('sharpe_ratio', 'N/A')}, Sortino: {perf.get('sortino_ratio', 'N/A')}
-- Max Drawdown: {perf.get('max_drawdown', 0)*100:.1f}%, Calmar: {perf.get('calmar_ratio', 'N/A')}
-- Win Rate: {perf.get('win_rate', 0)*100:.0f}%, Volatility: {perf.get('annualized_volatility', 0)*100:.1f}%
-
-vs {bench.get('benchmark', 'SPY')}:
-- Beta: {bench.get('beta', 'N/A')}, Alpha: {bench.get('alpha_annualized', 0)*100:.2f}%
-- Tracking Error: {bench.get('tracking_error', 0)*100:.1f}%, R²: {bench.get('r_squared', 'N/A')}
-- Up Capture: {bench.get('up_capture', 'N/A')}%, Down Capture: {bench.get('down_capture', 'N/A')}%
-
-Top Signals: {', '.join(f"{s['type']}: {s['name']}" for s in signals[:5])}
-Verdict: {rec['label']} (Score: {rec['combined_score']}/100)
-
-Return ONLY valid JSON (no markdown):
-{{
-  "technical_summary": "2-3 sentences on chart pattern and momentum",
-  "fundamental_summary": "2-3 sentences evaluating this ETF's quality (cost, performance, risk-adjusted returns)",
-  "investment_thesis": "1-2 sentence case for owning this ETF",
-  "key_risks": ["risk1", "risk2", "risk3"],
-  "key_catalysts": ["catalyst1", "catalyst2"],
-  "entry_strategy": "Specific price/conditions for entering this ETF position",
-  "price_target_6m": "6-month price level with reasoning based on trend and technicals",
-  "when_to_buy": "If not now, what market conditions or price levels should trigger a buy"
-}}"""
+ETF: Category={info.get('category','N/A')}, Family={info.get('fundFamily','N/A')}, AUM=${(info.get('totalAssets') or 0)/1e9:.1f}B, ER={(info.get('annualReportExpenseRatio') or 0)*100:.3f}%
+Technical: Price=${price:.2f}, RSI={rsi_s}, vs SMA50={"Above" if s50 and price>s50 else "Below"}, TechScore={rec['technical_score']}/100
+Performance: CAGR={p.get('return_1y',0)*100:.1f}%, Sharpe={p.get('sharpe_ratio','N/A')}, Sortino={p.get('sortino_ratio','N/A')}, MaxDD={p.get('max_drawdown',0)*100:.1f}%, Calmar={p.get('calmar_ratio','N/A')}
+vs {b.get('benchmark','SPY')}: Beta={b.get('beta','N/A')}, Alpha={b.get('alpha_annualized',0)*100:.2f}%, UpCapture={b.get('up_capture','N/A')}%, DnCapture={b.get('down_capture','N/A')}%
+Signals: {', '.join(f"{s['type']}:{s['name']}" for s in signals[:5])}
+Verdict: {rec['label']} ({rec['combined_score']}/100)"""
         else:
-            prompt = f"""You are a senior equity analyst. Analyze {symbol} ({info.get('longName', symbol)}).
+            prompt = f"""You are a senior equity analyst. Analyze {symbol} ({info.get('longName',symbol)}).
 
-Technical:
-- Price: ${price:.2f}, RSI(14): {rsi_str}
-- vs SMA50: {"Above" if sma50 and price > sma50 else "Below"} (${sma50:.2f if sma50 else 0:.2f})
-- vs SMA200: {"Above" if sma200 and price > sma200 else "Below"} (${sma200:.2f if sma200 else 0:.2f})
-- Technical Score: {rec['technical_score']}/100
+Technical: Price=${price:.2f}, RSI={rsi_s}, vs SMA50={"Above" if s50 and price>s50 else "Below"}, vs SMA200={"Above" if s200 and price>s200 else "Below"}, TechScore={rec['technical_score']}/100
+Fundamental: Sector={info.get('sector','N/A')}, PE={info.get('trailingPE','N/A')}, FwdPE={info.get('forwardPE','N/A')}, RevGrowth={f"{info.get('revenueGrowth',0)*100:.1f}%" if info.get('revenueGrowth') else 'N/A'}, Margin={f"{info.get('profitMargins',0)*100:.1f}%" if info.get('profitMargins') else 'N/A'}, Target=${info.get('targetMeanPrice','N/A')}, FundScore={rec['fundamental_score']}/100
+Signals: {', '.join(f"{s['type']}:{s['name']}" for s in signals[:6])}
+Verdict: {rec['label']} ({rec['combined_score']}/100)"""
 
-Fundamental:
-- Sector: {info.get('sector','N/A')}, Industry: {info.get('industry','N/A')}
-- P/E: {info.get('trailingPE','N/A')}, Forward P/E: {info.get('forwardPE','N/A')}
-- Revenue Growth: {f"{info.get('revenueGrowth',0)*100:.1f}%" if info.get('revenueGrowth') else 'N/A'}
-- Profit Margin: {f"{info.get('profitMargins',0)*100:.1f}%" if info.get('profitMargins') else 'N/A'}
-- Analyst Target: ${info.get('targetMeanPrice','N/A')}, Rec: {info.get('recommendationKey','N/A')}
-- Fundamental Score: {rec['fundamental_score']}/100
+        prompt += """\n\nReturn ONLY valid JSON (no markdown):
+{"technical_summary":"2-3 sentences","fundamental_summary":"2-3 sentences","investment_thesis":"1-2 sentences","key_risks":["r1","r2","r3"],"key_catalysts":["c1","c2"],"entry_strategy":"specific levels","price_target_6m":"target with reasoning","when_to_buy":"conditions if not now"}"""
 
-Top Signals: {', '.join(f"{s['type']}: {s['name']}" for s in signals[:6])}
-Verdict: {rec['label']} (Score: {rec['combined_score']}/100)
-
-Return ONLY valid JSON (no markdown):
-{{
-  "technical_summary": "2-3 sentences on chart pattern and momentum",
-  "fundamental_summary": "2-3 sentences on valuation, growth, and financial health",
-  "investment_thesis": "1-2 sentence bull case",
-  "key_risks": ["risk1", "risk2", "risk3"],
-  "key_catalysts": ["catalyst1", "catalyst2"],
-  "entry_strategy": "Specific price levels or conditions to consider buying",
-  "price_target_6m": "6-month price target with reasoning",
-  "when_to_buy": "If not now, what conditions/price should trigger a buy"
-}}"""
-
-        response = client.messages.create(
-            model="claude-sonnet-4-6",
-            max_tokens=1024,
-            system="You are an expert financial analyst. Return only valid JSON, no markdown fences.",
-            messages=[{"role": "user", "content": prompt}]
-        )
-        text = response.content[0].text.strip()
+        resp = client.messages.create(model="claude-sonnet-4-6", max_tokens=1024,
+            system="Expert financial analyst. Return only valid JSON, no markdown.",
+            messages=[{"role":"user","content":prompt}])
+        text = resp.content[0].text.strip()
         m = re.search(r'\{.*\}', text, re.DOTALL)
-        if m:
-            return json.loads(m.group())
+        if m: return json.loads(m.group())
     except Exception as e:
-        print(f"AI analysis error for {symbol}: {e}")
+        print(f"AI error: {e}")
     return None
 
 
-# ─── Main Endpoint ────────────────────────────────────────────────────────────
+# ─── Health & Cache ───────────────────────────────────────────────────────────
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "cached_symbols": list(_cache.keys())}
+    return {"status":"ok","cached_symbols":list(_cache.keys())}
 
 @app.delete("/api/cache")
 async def clear_cache():
     _cache.clear(); _cache_ts.clear()
-    return {"status": "cache cleared"}
+    return {"status":"cache cleared"}
 
+
+# ─── Main Analyze Endpoint ────────────────────────────────────────────────────
 
 @app.post("/api/analyze")
 async def analyze(request: AnalyzeRequest):
     results = {}
-    for raw_symbol in request.symbols:
-        symbol = raw_symbol.upper().strip()
-        if not symbol:
-            continue
-        # Return cached result if fresh
+    for raw in request.symbols:
+        symbol = raw.upper().strip()
+        if not symbol: continue
+
         cached = _cache_get(symbol)
         if cached:
             results[symbol] = cached
             continue
 
         try:
-            ticker = yf.Ticker(symbol, session=_session)
-
-            # Fetch history — try download() first (different rate-limit path), fall back to history()
-            hist = None
-            for attempt in range(4):
-                try:
-                    dl = yf.download(symbol, period="1y", auto_adjust=True,
-                                     progress=False, session=_session)
-                    if not dl.empty:
-                        # download() returns MultiIndex columns when single ticker
-                        if isinstance(dl.columns, pd.MultiIndex):
-                            dl.columns = dl.columns.droplevel(1)
-                        dl.index = dl.index.tz_localize(None) if dl.index.tz else dl.index
-                        hist = dl
-                        break
-                    time.sleep(3 * (attempt + 1))
-                except Exception:
-                    # Fallback to history()
-                    try:
-                        hist = ticker.history(period="1y", auto_adjust=True)
-                        if not hist.empty:
-                            hist.index = hist.index.tz_localize(None) if hist.index.tz else hist.index
-                            break
-                    except Exception as e2:
-                        err_str = str(e2).lower()
-                        wait = 15 * (2 ** attempt) if ("rate" in err_str or "too many" in err_str) else 5
-                        print(f"Rate limited on {symbol}, waiting {wait}s...")
-                        time.sleep(wait)
-            if hist is None or hist.empty:
-                results[symbol] = {"error": f"No data found for '{symbol}'", "symbol": symbol}
+            # Fetch history
+            hist = _yf.get_history(symbol)
+            if hist.empty:
+                results[symbol] = {"error": f"No data found for '{symbol}'. Check the ticker symbol.", "symbol": symbol}
                 continue
 
-            # Compute technical indicators
+            # Add indicators
             hist["SMA20"]  = hist["Close"].rolling(20).mean()
             hist["SMA50"]  = hist["Close"].rolling(50).mean()
             hist["SMA200"] = hist["Close"].rolling(200).mean()
             hist["EMA12"]  = hist["Close"].ewm(span=12, adjust=False).mean()
             hist["EMA26"]  = hist["Close"].ewm(span=26, adjust=False).mean()
-            hist["RSI"]    = calculate_rsi(hist["Close"])
-            hist["MACD"], hist["MACD_signal"], hist["MACD_hist"] = calculate_macd(hist["Close"])
-            hist["BB_upper"], hist["BB_middle"], hist["BB_lower"] = calculate_bollinger(hist["Close"])
-            hist["Stoch_K"], hist["Stoch_D"] = calculate_stochastic(hist["High"], hist["Low"], hist["Close"])
-            hist["ATR"] = calculate_atr(hist["High"], hist["Low"], hist["Close"])
-            hist["OBV"] = calculate_obv(hist["Close"], hist["Volume"])
+            hist["RSI"]    = calc_rsi(hist["Close"])
+            hist["MACD"],hist["MACD_signal"],hist["MACD_hist"] = calc_macd(hist["Close"])
+            hist["BB_upper"],hist["BB_middle"],hist["BB_lower"] = calc_boll(hist["Close"])
+            hist["Stoch_K"],hist["Stoch_D"] = calc_stoch(hist["High"],hist["Low"],hist["Close"])
+            hist["ATR"] = calc_atr(hist["High"],hist["Low"],hist["Close"])
+            hist["OBV"] = calc_obv(hist["Close"],hist["Volume"])
 
-            candles = [
-                {
-                    "time": idx.strftime("%Y-%m-%d"),
-                    "open": round(float(r["Open"]), 4),
-                    "high": round(float(r["High"]), 4),
-                    "low": round(float(r["Low"]), 4),
-                    "close": round(float(r["Close"]), 4),
-                    "volume": int(r["Volume"]),
-                }
-                for idx, r in hist.iterrows()
-            ]
+            candles = [{"time":idx.strftime("%Y-%m-%d"),"open":round(float(r["Open"]),4),
+                        "high":round(float(r["High"]),4),"low":round(float(r["Low"]),4),
+                        "close":round(float(r["Close"]),4),"volume":int(r["Volume"])}
+                       for idx,r in hist.iterrows()]
 
             signals = generate_signals(hist)
+            info = _yf.get_info(symbol)
+            is_etf = info.get("quoteType","").upper() == "ETF"
 
-            info = {}
-            try:
-                info = ticker.info or {}
-            except Exception:
-                pass
-
-            # Detect ETF
-            is_etf = info.get("quoteType", "").upper() == "ETF"
-
-            # ETF-specific data
+            # ETF-specific metrics
             etf_data: Dict = {}
             if is_etf:
-                perf = calculate_performance_metrics(hist)
-                bench = calculate_benchmark_comparison(hist, symbol)
-                holdings = get_etf_holdings(ticker)
-                fscore = etf_fundamental_score(info, perf, bench)
+                perf = calc_perf(hist)
+                bench = calc_bench(hist, symbol)
+                fscore = etf_fscore(info, perf, bench)
                 etf_data = {
                     "performance_metrics": perf,
                     "benchmark_comparison": bench,
-                    "holdings": holdings,
-                    "expense_ratio": info.get("annualReportExpenseRatio") or info.get("expenseRatio"),
-                    "aum": info.get("totalAssets"),
-                    "distribution_yield": info.get("yield"),
-                    "category": info.get("category"),
-                    "fund_family": info.get("fundFamily"),
-                    "beta_3y": info.get("beta3Year"),
-                    "return_3y": info.get("threeYearAverageReturn"),
-                    "return_5y": info.get("fiveYearAverageReturn"),
-                    "ytd_return": info.get("ytdReturn"),
-                    "nav_price": info.get("navPrice"),
-                    "description": (info.get("longBusinessSummary") or "")[:600],
+                    "holdings": {
+                        "top_holdings": info.get("_topHoldings", []),
+                        "sector_weightings": info.get("_sectorWeightings", {}),
+                        "asset_classes": {k:v for k,v in (info.get("_assetClasses") or {}).items() if v},
+                        "equity_holdings": info.get("_equityHoldings", {}),
+                        "bond_holdings": {},
+                    },
+                    "expense_ratio":      info.get("annualReportExpenseRatio"),
+                    "aum":                info.get("totalAssets"),
+                    "distribution_yield": info.get("yield") or info.get("dividendYield"),
+                    "category":           info.get("category"),
+                    "fund_family":        info.get("fundFamily"),
+                    "beta_3y":            info.get("beta3Year"),
+                    "return_3y":          info.get("threeYearAverageReturn"),
+                    "return_5y":          info.get("fiveYearAverageReturn"),
+                    "ytd_return":         info.get("ytdReturn"),
+                    "nav_price":          info.get("navPrice"),
+                    "description":        (info.get("longBusinessSummary") or "")[:600],
                 }
             else:
-                fscore = stock_fundamental_score(info)
+                fscore = stock_fscore(info)
 
             rec = get_recommendation(signals, fscore)
-
             price  = float(hist["Close"].iloc[-1])
             w52h   = float(hist["High"].max())
             w52l   = float(hist["Low"].min())
-            sup90  = float(hist.iloc[-90:]["Low"].min())  if len(hist) >= 90 else float(hist["Low"].min())
-            res90  = float(hist.iloc[-90:]["High"].max()) if len(hist) >= 90 else float(hist["High"].max())
-            fib    = {k: round(w52h - v * (w52h - w52l), 2) for k, v in
-                      {"0.236": 0.236, "0.382": 0.382, "0.5": 0.5, "0.618": 0.618, "0.786": 0.786}.items()}
+            sup90  = float(hist.iloc[-90:]["Low"].min())  if len(hist)>=90 else float(hist["Low"].min())
+            res90  = float(hist.iloc[-90:]["High"].max()) if len(hist)>=90 else float(hist["High"].max())
+            fib    = {k:round(w52h-v*(w52h-w52l),2) for k,v in
+                      {"0.236":0.236,"0.382":0.382,"0.5":0.5,"0.618":0.618,"0.786":0.786}.items()}
+            s20v   = float(hist["SMA20"].iloc[-1]) if not pd.isna(hist["SMA20"].iloc[-1]) else price
+            atr_v  = float(hist["ATR"].iloc[-1])   if not pd.isna(hist["ATR"].iloc[-1])   else 0
 
-            target_mean = info.get("targetMeanPrice")
-            target_high = info.get("targetHighPrice")
-            target_low  = info.get("targetLowPrice")
-            sma20_val   = float(hist["SMA20"].iloc[-1]) if not pd.isna(hist["SMA20"].iloc[-1]) else price
-            atr_val     = float(hist["ATR"].iloc[-1])   if not pd.isna(hist["ATR"].iloc[-1])   else 0
-
-            if rec["action"] in ("BUY", "ACCUMULATE"):
-                entry = round(min(price, sma20_val), 2)
-                if is_etf:
-                    entry_note = (f"Enter near SMA20 (${sma20_val:.2f}) or on a dip to support (${sup90:.2f}). "
-                                  f"Stop-loss at ${round(entry - 2*atr_val, 2)}. Use DCA for position building.")
-                else:
-                    entry_note = f"Buy near current price or SMA20 (${sma20_val:.2f}). Stop-loss at ${round(entry - 2*atr_val, 2)}."
-            elif rec["action"] == "HOLD":
-                entry = round(sup90 * 1.01, 2)
-                entry_note = f"Wait for pullback toward support (${sup90:.2f}) before adding."
+            tm = info.get("targetMeanPrice"); th_ = info.get("targetHighPrice"); tl = info.get("targetLowPrice")
+            if rec["action"] in ("BUY","ACCUMULATE"):
+                entry = round(min(price,s20v),2)
+                enote = f"Enter near SMA20 (${s20v:.2f}) or support (${sup90:.2f}). Stop-loss ~${round(entry-2*atr_v,2)}."
+            elif rec["action"]=="HOLD":
+                entry = round(sup90*1.01,2); enote = f"Wait for pullback toward support (${sup90:.2f})."
             else:
-                entry = round(w52l * 1.02, 2)
-                entry_note = f"Avoid for now. Revisit near 52-week low (${w52l:.2f}) after trend reversal confirmed."
+                entry = round(w52l*1.02,2); enote = f"Avoid now. Revisit near 52-week low (${w52l:.2f}) after reversal."
 
-            news = []
-            try:
-                for item in (ticker.news or [])[:10]:
-                    news.append({
-                        "title": item.get("title", ""),
-                        "publisher": item.get("publisher", ""),
-                        "link": item.get("link", ""),
-                        "publishedAt": item.get("providerPublishTime", 0),
-                    })
-            except Exception:
-                pass
+            news = _yf.get_news(symbol)
+            ai   = get_ai_analysis(symbol, info, hist, signals, rec, is_etf, etf_data if is_etf else None)
 
-            ai = get_ai_analysis(symbol, info, hist, signals, rec, is_etf, etf_data if is_etf else None)
-
-            results[symbol] = {
-                "symbol": symbol,
-                "is_etf": is_etf,
+            result = {
+                "symbol": symbol, "is_etf": is_etf,
                 "company_name": info.get("longName", symbol),
-                "sector": info.get("sector", info.get("category", "N/A")),
-                "industry": info.get("industry", info.get("fundFamily", "N/A")),
-                "current_price": round(price, 2),
-                "currency": info.get("currency", "USD"),
+                "sector": info.get("sector") or info.get("category","N/A"),
+                "industry": info.get("industry") or info.get("fundFamily","N/A"),
+                "current_price": round(price,2),
+                "currency": info.get("currency","USD"),
                 "market_cap": info.get("marketCap") or info.get("totalAssets"),
-                "week52_high": round(w52h, 2),
-                "week52_low": round(w52l, 2),
+                "week52_high": round(w52h,2), "week52_low": round(w52l,2),
                 "technical": {
                     "candles": candles,
-                    "indicators": {
-                        "sma20": to_series(hist, "SMA20"),
-                        "sma50": to_series(hist, "SMA50"),
-                        "sma200": to_series(hist, "SMA200"),
-                        "ema12": to_series(hist, "EMA12"),
-                        "ema26": to_series(hist, "EMA26"),
-                        "rsi": to_series(hist, "RSI"),
-                        "macd": to_series(hist, "MACD"),
-                        "macd_signal": to_series(hist, "MACD_signal"),
-                        "macd_hist": to_series(hist, "MACD_hist"),
-                        "bb_upper": to_series(hist, "BB_upper"),
-                        "bb_middle": to_series(hist, "BB_middle"),
-                        "bb_lower": to_series(hist, "BB_lower"),
-                        "stoch_k": to_series(hist, "Stoch_K"),
-                        "stoch_d": to_series(hist, "Stoch_D"),
-                        "atr": to_series(hist, "ATR"),
-                        "obv": to_series(hist, "OBV"),
-                    },
+                    "indicators": {k: to_series(hist, col) for k,col in [
+                        ("sma20","SMA20"),("sma50","SMA50"),("sma200","SMA200"),
+                        ("ema12","EMA12"),("ema26","EMA26"),("rsi","RSI"),
+                        ("macd","MACD"),("macd_signal","MACD_signal"),("macd_hist","MACD_hist"),
+                        ("bb_upper","BB_upper"),("bb_middle","BB_middle"),("bb_lower","BB_lower"),
+                        ("stoch_k","Stoch_K"),("stoch_d","Stoch_D"),("atr","ATR"),("obv","OBV"),
+                    ]},
                     "signals": signals,
-                    "support": round(sup90, 2),
-                    "resistance": round(res90, 2),
-                    "fib_levels": fib,
-                    "atr": round(atr_val, 2),
+                    "support": round(sup90,2), "resistance": round(res90,2),
+                    "fib_levels": fib, "atr": round(atr_v,2),
                 },
                 "fundamental": {
-                    # Stock fields
-                    "pe_ratio": info.get("trailingPE"),
-                    "forward_pe": info.get("forwardPE"),
-                    "peg_ratio": info.get("pegRatio"),
-                    "pb_ratio": info.get("priceToBook"),
-                    "ps_ratio": info.get("priceToSalesTrailing12Months"),
-                    "ev_ebitda": info.get("enterpriseToEbitda"),
-                    "revenue_growth": info.get("revenueGrowth"),
-                    "earnings_growth": info.get("earningsGrowth"),
-                    "gross_margins": info.get("grossMargins"),
-                    "operating_margins": info.get("operatingMargins"),
-                    "profit_margins": info.get("profitMargins"),
-                    "roe": info.get("returnOnEquity"),
-                    "roa": info.get("returnOnAssets"),
-                    "debt_to_equity": info.get("debtToEquity"),
-                    "current_ratio": info.get("currentRatio"),
-                    "quick_ratio": info.get("quickRatio"),
-                    "free_cash_flow": info.get("freeCashflow"),
-                    "dividend_yield": info.get("dividendYield"),
-                    "eps": info.get("trailingEps"),
-                    "forward_eps": info.get("forwardEps"),
-                    "book_value": info.get("bookValue"),
-                    "revenue": info.get("totalRevenue"),
-                    "net_income": info.get("netIncomeToCommon"),
-                    "analyst_recommendation": info.get("recommendationKey", "N/A"),
-                    "recommendation_mean": info.get("recommendationMean"),
-                    "target_high": target_high,
-                    "target_low": target_low,
-                    "target_mean": target_mean,
-                    "analyst_count": info.get("numberOfAnalystOpinions"),
-                    "description": (info.get("longBusinessSummary") or "")[:600],
-                    "news": news,
-                    "fundamental_score": round(fscore * 100, 1),
+                    "pe_ratio":info.get("trailingPE"),"forward_pe":info.get("forwardPE"),
+                    "peg_ratio":info.get("pegRatio"),"pb_ratio":info.get("priceToBook"),
+                    "ps_ratio":info.get("priceToSalesTrailing12Months"),
+                    "ev_ebitda":info.get("enterpriseToEbitda"),
+                    "revenue_growth":info.get("revenueGrowth"),"earnings_growth":info.get("earningsGrowth"),
+                    "gross_margins":info.get("grossMargins"),"operating_margins":info.get("operatingMargins"),
+                    "profit_margins":info.get("profitMargins"),"roe":info.get("returnOnEquity"),
+                    "roa":info.get("returnOnAssets"),"debt_to_equity":info.get("debtToEquity"),
+                    "current_ratio":info.get("currentRatio"),"quick_ratio":info.get("quickRatio"),
+                    "free_cash_flow":info.get("freeCashflow"),"dividend_yield":info.get("dividendYield"),
+                    "eps":info.get("trailingEps"),"forward_eps":info.get("forwardEps"),
+                    "book_value":info.get("bookValue"),"revenue":info.get("totalRevenue"),
+                    "net_income":info.get("netIncomeToCommon"),
+                    "analyst_recommendation":info.get("recommendationKey","N/A"),
+                    "recommendation_mean":info.get("recommendationMean"),
+                    "target_high":th_,"target_low":tl,"target_mean":tm,
+                    "analyst_count":info.get("numberOfAnalystOpinions"),
+                    "description":(info.get("longBusinessSummary") or "")[:600],
+                    "news":news,"fundamental_score":round(fscore*100,1),
                 },
                 "etf_data": etf_data,
                 "recommendation": rec,
                 "entry_point": {
-                    "suggested_price": entry,
-                    "note": entry_note,
-                    "target_mean": target_mean,
-                    "target_high": target_high,
-                    "target_low": target_low,
-                    "upside_pct": round((target_mean / price - 1) * 100, 1) if target_mean and price else None,
+                    "suggested_price":entry,"note":enote,"target_mean":tm,
+                    "target_high":th_,"target_low":tl,
+                    "upside_pct":round((tm/price-1)*100,1) if tm and price else None,
                 },
                 "ai_analysis": ai,
             }
-            _cache_set(symbol, results[symbol])
+            _cache_set(symbol, result)
+            results[symbol] = result
+
         except Exception as e:
             results[symbol] = {"error": str(e), "symbol": symbol}
 
-        # Small cooldown between symbols to avoid rate limiting
         if len(request.symbols) > 1:
-            time.sleep(3)
+            time.sleep(2)
 
     return results
 
 
-# ─── Serve React Frontend (production) ───────────────────────────────────────
-# When deployed, the built React app lives in ./static/
-_STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+# ─── Serve React Frontend ─────────────────────────────────────────────────────
 
-if os.path.isdir(_STATIC_DIR):
-    # Serve JS/CSS/image assets
-    _ASSETS = os.path.join(_STATIC_DIR, "assets")
+_STATIC = os.path.join(os.path.dirname(__file__), "static")
+if os.path.isdir(_STATIC):
+    _ASSETS = os.path.join(_STATIC, "assets")
     if os.path.isdir(_ASSETS):
         app.mount("/assets", StaticFiles(directory=_ASSETS), name="assets")
 
-    # Serve index.html for all non-API paths (SPA routing)
     @app.get("/{full_path:path}")
-    async def serve_spa(full_path: str):
-        static_file = os.path.join(_STATIC_DIR, full_path)
-        if os.path.isfile(static_file):
-            return FileResponse(static_file)
-        return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
-
+    async def spa(full_path: str):
+        f = os.path.join(_STATIC, full_path)
+        if os.path.isfile(f): return FileResponse(f)
+        return FileResponse(os.path.join(_STATIC, "index.html"))
