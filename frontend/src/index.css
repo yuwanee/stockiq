@@ -1,0 +1,26 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+* { box-sizing: border-box; }
+
+body {
+  background-color: #0f1117;
+  color: #e2e8f0;
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  margin: 0;
+}
+
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: #1a1d27; }
+::-webkit-scrollbar-thumb { background: #3b4155; border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: #4a5170; }
+
+.tab-active {
+  border-bottom: 2px solid #3b82f6;
+  color: #3b82f6;
+}
+
+.signal-bullish { color: #22c55e; }
+.signal-bearish { color: #ef4444; }
+.signal-neutral { color: #eab308; }

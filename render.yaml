@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: stockiq
+    runtime: docker
+    dockerfilePath: ./Dockerfile
+    plan: free
+    envVars:
+      - key: ENVIRONMENT
+        value: production
+      - key: ANTHROPIC_API_KEY
+        sync: false   # You'll paste this in the Render dashboard
