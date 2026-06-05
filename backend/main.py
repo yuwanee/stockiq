@@ -6,7 +6,9 @@ from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 import pandas as pd
 import numpy as np
-import os, json, re, time, requests
+import os, json, re, time, requests, math
+from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import anthropic
@@ -752,6 +754,457 @@ async def analyze(request: AnalyzeRequest):
             time.sleep(2)
 
     return results
+
+
+# ─── Options Trading Assistant ───────────────────────────────────────────────
+
+# Top 45 most liquid US stocks/ETFs with active options markets
+OPTION_UNIVERSE = [
+    "AAPL","MSFT","NVDA","TSLA","AMZN","META","GOOGL","AMD","SPY","QQQ",
+    "IWM","COIN","MARA","PLTR","RIVN","NIO","SNAP","RBLX","HOOD","UBER",
+    "JPM","BAC","GS","V","MA","PYPL","WFC","C",
+    "NFLX","DIS","SHOP","SNOW","CRM","ORCL","ADBE",
+    "MRNA","PFE","LLY","ABBV","UNH","BNTX",
+    "XOM","CVX","OXY","XLE",
+    "MU","INTC","QCOM","SMCI","AMAT",
+    "GME","AMC","BBBY",
+]
+OPTION_UNIVERSE = list(dict.fromkeys(OPTION_UNIVERSE))  # deduplicate
+
+# Options scan cache (10-minute TTL — market moves)
+_opt_cache: Optional[Dict] = None
+_opt_cache_ts: float = 0
+OPT_CACHE_TTL = 600  # 10 minutes
+
+
+class OptionsScanRequest(BaseModel):
+    capital: float
+    max_picks: int = 3
+
+
+# ── Black-Scholes helpers (no scipy needed) ───────────────────────────────────
+
+def _ncdf(x: float) -> float:
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+def bs_delta(S: float, K: float, T: float, sigma: float, is_call: bool) -> float:
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.5 if is_call else -0.5
+    r = 0.053
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return _ncdf(d1) if is_call else _ncdf(d1) - 1.0
+
+def bs_theta(S: float, K: float, T: float, sigma: float, is_call: bool) -> float:
+    """Daily theta decay in $."""
+    if T <= 0 or sigma <= 0: return 0.0
+    r = 0.053
+    d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    pdf_d1 = math.exp(-0.5 * d1 ** 2) / math.sqrt(2 * math.pi)
+    if is_call:
+        theta = (-S * pdf_d1 * sigma / (2 * math.sqrt(T)) - r * K * math.exp(-r * T) * _ncdf(d2)) / 365
+    else:
+        theta = (-S * pdf_d1 * sigma / (2 * math.sqrt(T)) + r * K * math.exp(-r * T) * _ncdf(-d2)) / 365
+    return theta
+
+
+# ── Momentum scoring ──────────────────────────────────────────────────────────
+
+def momentum_score(hist: pd.DataFrame) -> float:
+    """Positive = bullish, negative = bearish. Magnitude = strength."""
+    if len(hist) < 15: return 0.0
+    close = hist["Close"]
+    price = float(close.iloc[-1])
+
+    rsi_s = calc_rsi(close)
+    rsi = float(rsi_s.iloc[-1]) if not pd.isna(rsi_s.iloc[-1]) else 50.0
+
+    sma5  = float(close.rolling(5).mean().iloc[-1])
+    sma20 = float(close.rolling(20).mean().iloc[-1])
+
+    _, _, macd_hist_s = calc_macd(close)
+    macd_h = float(macd_hist_s.iloc[-1]) if not pd.isna(macd_hist_s.iloc[-1]) else 0.0
+
+    vol_avg = float(hist["Volume"].rolling(20).mean().iloc[-1])
+    vol_ratio = float(hist["Volume"].iloc[-1]) / vol_avg if vol_avg > 0 else 1.0
+
+    ret_1d = (float(close.iloc[-1]) - float(close.iloc[-2])) / float(close.iloc[-2]) if len(close) >= 2 else 0.0
+    ret_5d = (float(close.iloc[-1]) - float(close.iloc[-5])) / float(close.iloc[-5]) if len(close) >= 5 else 0.0
+
+    score = 0.0
+
+    # RSI (−1.5 to +1.5)
+    if rsi >= 55:   score += min((rsi - 50) / 30, 1.0) * 1.5
+    elif rsi <= 45: score -= min((50 - rsi) / 30, 1.0) * 1.5
+
+    # MA trend (−0.8 to +0.8)
+    if price > sma5 > sma20:   score += 0.8
+    elif price < sma5 < sma20: score -= 0.8
+    elif price > sma20: score += 0.3
+    elif price < sma20: score -= 0.3
+
+    # MACD histogram
+    if macd_h > 0: score += 0.5
+    elif macd_h < 0: score -= 0.5
+
+    # Recent returns
+    score += ret_1d * 8
+    score += ret_5d * 3
+
+    # Volume amplifier
+    if vol_ratio > 1.3:
+        score *= 1.0 + (vol_ratio - 1.3) * 0.25
+
+    return round(score, 4)
+
+
+def _fetch_momentum(symbol: str) -> Optional[Dict]:
+    try:
+        hist = _yf.get_history(symbol, days=30)
+        if hist.empty or len(hist) < 10: return None
+        score = momentum_score(hist)
+        rsi_s = calc_rsi(hist["Close"])
+        sma20 = float(hist["Close"].rolling(20).mean().iloc[-1])
+        return {
+            "symbol": symbol,
+            "score": score,
+            "direction": "CALL" if score > 0 else "PUT",
+            "abs_score": abs(score),
+            "price": float(hist["Close"].iloc[-1]),
+            "rsi": float(rsi_s.iloc[-1]) if not pd.isna(rsi_s.iloc[-1]) else 50.0,
+            "price_vs_sma20": "above" if float(hist["Close"].iloc[-1]) > sma20 else "below",
+            "hist": hist,
+        }
+    except Exception as e:
+        print(f"Momentum error {symbol}: {e}")
+        return None
+
+
+# ── Options chain fetcher ─────────────────────────────────────────────────────
+
+def _get_options_chain(symbol: str, min_dte: int = 14, max_dte: int = 45) -> Optional[Dict]:
+    """Fetch Yahoo Finance options chain targeting 14-45 DTE monthly options."""
+    BASES = ["https://query1.finance.yahoo.com", "https://query2.finance.yahoo.com"]
+    try:
+        _yf._get_crumb(symbol)
+        crumb_param = {"crumb": _yf._crumb} if _yf._crumb else {}
+
+        # ── Step 1: fetch expiration list (try query1 first) ──
+        res = None
+        for base in BASES:
+            try:
+                r = _yf._session.get(f"{base}/v7/finance/options/{symbol}",
+                                     params=crumb_param, timeout=15)
+                if r.status_code != 200: continue
+                res_list = (r.json().get("optionChain") or {}).get("result") or []
+                if res_list:
+                    res = res_list[0]; break
+            except Exception:
+                continue
+        if not res: return None
+
+        quote_price = (res.get("quote") or {}).get("regularMarketPrice") or 0
+        if not quote_price: return None
+
+        now_ts = time.time()
+        all_exp = res.get("expirationDates") or []
+
+        # Target 14-45 DTE; fall back progressively to any available expiry
+        valid_exp = [e for e in all_exp if min_dte * 86400 <= (e - now_ts) <= max_dte * 86400]
+        if not valid_exp:
+            valid_exp = [e for e in all_exp if 7 * 86400 <= (e - now_ts) <= 60 * 86400]
+        if not valid_exp:
+            valid_exp = [e for e in all_exp if 0 < (e - now_ts) <= 90 * 86400]
+        if not valid_exp: return None
+
+        # Pick expiry closest to 30 DTE
+        valid_exp.sort(key=lambda e: abs((e - now_ts) / 86400 - 30))
+
+        # ── Step 2: fetch the selected expiry chain ──
+        for expiry in valid_exp[:3]:
+            chain_params = {"date": expiry, **crumb_param}
+            for base in BASES:
+                try:
+                    r2 = _yf._session.get(f"{base}/v7/finance/options/{symbol}",
+                                          params=chain_params, timeout=15)
+                    if r2.status_code != 200: continue
+                    r2_res = (r2.json().get("optionChain") or {}).get("result") or []
+                    if not r2_res: continue
+                    opts = r2_res[0].get("options") or []
+                    if not opts: continue
+
+                    dte = max(0, int((expiry - now_ts) / 86400))
+                    exp_date = datetime.fromtimestamp(expiry, tz=timezone.utc).strftime("%Y-%m-%d")
+                    return {
+                        "quote_price": quote_price,
+                        "expiry_date": exp_date,
+                        "dte": dte,
+                        "calls": opts[0].get("calls") or [],
+                        "puts":  opts[0].get("puts")  or [],
+                    }
+                except Exception:
+                    continue
+        return None
+    except Exception as e:
+        print(f"Options chain error {symbol}: {e}")
+        return None
+
+
+def _filter_options(contracts: list, current_price: float, is_call: bool,
+                    allocation: float, dte: int) -> list:
+    """Filter and score option contracts by liquidity, moneyness, greeks."""
+    T = max(dte, 1) / 365.0
+    results = []
+
+    for opt in contracts:
+        raw_ask = opt.get("ask") or 0
+        raw_bid = opt.get("bid") or 0
+        last    = opt.get("lastPrice") or 0
+        strike  = opt.get("strike") or 0
+        volume  = opt.get("volume") or 0
+        oi      = opt.get("openInterest") or 0
+        iv      = opt.get("impliedVolatility") or 0
+
+        if strike <= 0: continue
+
+        # Use lastPrice when market is closed (ask=0)
+        market_closed = raw_ask <= 0
+        ask = raw_ask if raw_ask > 0 else last
+        if ask <= 0: continue
+        bid = raw_bid if raw_bid > 0 else (ask * 0.95 if not market_closed else ask * 0.97)
+        mid = (ask + bid) / 2.0
+        spread_pct = (ask - bid) / mid if mid > 0 else (0.03 if market_closed else 1.0)
+
+        # ── Liquidity gates (relaxed for monthly options) ──
+        if volume < 5:          continue
+        if oi < 20:             continue
+        if not market_closed and spread_pct > 0.50: continue  # skip spread gate when closed
+
+        # ── Moneyness: ITM through ~15% OTM ──
+        mono = strike / current_price if is_call else current_price / strike
+        if not (0.85 <= mono <= 1.15): continue
+
+        # ── Greeks — use floor IV of 0.25 when reported IV is too low (stale/closed) ──
+        eff_iv = iv if iv >= 0.05 else 0.25
+        delta = bs_delta(current_price, strike, T, eff_iv, is_call)
+        theta = bs_theta(current_price, strike, T, eff_iv, is_call)
+        delta_abs = abs(delta)
+        if not (0.20 <= delta_abs <= 0.85): continue
+
+        # ── Score (favour near-ATM, liquid, tight spread) ──
+        delta_score  = max(0.0, 1.0 - abs(delta_abs - 0.50) * 2.5)
+        vol_score    = min(volume / 500.0, 1.0)
+        oi_score     = min(oi    / 2000.0, 1.0)
+        spread_score = max(0.0, 1.0 - spread_pct * 2)
+        theta_score  = max(0.0, 1.0 - abs(theta) / max(ask * 0.05, 0.01))
+        iv_score     = max(0.0, 1.0 - eff_iv * 1.2) if eff_iv > 0 else 0.5
+
+        score = (vol_score * 0.25 + oi_score * 0.20 + spread_score * 0.25 +
+                 delta_score * 0.18 + theta_score * 0.07 + iv_score * 0.05)
+
+        results.append({
+            "score": score,
+            "strike": strike,
+            "ask": round(ask, 2),
+            "bid": round(bid, 2),
+            "mid": round(mid, 2),
+            "volume": int(volume),
+            "open_interest": int(oi),
+            "implied_volatility": round(eff_iv * 100, 1),
+            "delta": round(delta, 3),
+            "theta": round(theta, 4),
+            "spread_pct": round(spread_pct * 100, 1),
+            "in_the_money": opt.get("inTheMoney") or False,
+            "contract_symbol": opt.get("contractSymbol") or "",
+            "price_is_last": market_closed,
+        })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results
+
+
+# ── Main scan endpoint ────────────────────────────────────────────────────────
+
+@app.post("/api/options/scan")
+async def scan_options(request: OptionsScanRequest):
+    global _opt_cache, _opt_cache_ts
+
+    capital = request.capital
+    n_picks = min(max(request.max_picks, 1), 3)
+
+    if capital < 200:
+        raise HTTPException(status_code=400, detail="Minimum capital is $200")
+
+    # Return cache if fresh
+    cache_key = f"{capital}_{n_picks}"
+    if (_opt_cache and _opt_cache.get("_key") == cache_key
+            and time.time() - _opt_cache_ts < OPT_CACHE_TTL):
+        return _opt_cache
+
+    # ── 1. Parallel momentum scan ──────────────────────────────────────────────
+    scored: list = []
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        futs = {pool.submit(_fetch_momentum, sym): sym for sym in OPTION_UNIVERSE}
+        for fut in as_completed(futs, timeout=30):
+            res = fut.result()
+            if res: scored.append(res)
+
+    if not scored:
+        return {"date": datetime.now(timezone.utc).strftime("%Y-%m-%d"), "capital": capital,
+                "picks": [], "error": "Could not fetch market data. Try again in a few minutes."}
+
+    scored.sort(key=lambda x: x["abs_score"], reverse=True)
+
+    # ── 2. Find valid options for top candidates ───────────────────────────────
+    allocation = capital / n_picks
+    picks: list = []
+    used_symbols: set = set()
+
+    # Try up to 25 candidates to fill n_picks slots
+    for candidate in scored[:25]:
+        if len(picks) >= n_picks: break
+        sym = candidate["symbol"]
+        if sym in used_symbols: continue
+        used_symbols.add(sym)
+
+        chain = _get_options_chain(sym)
+        if not chain: continue
+
+        is_call = candidate["direction"] == "CALL"
+        contracts_raw = chain["calls"] if is_call else chain["puts"]
+        filtered = _filter_options(contracts_raw, chain["quote_price"], is_call, allocation, chain["dte"])
+        if not filtered: continue
+
+        best = filtered[0]
+        ask = best["ask"]
+        cost_per_contract = ask * 100
+        # Always show the trade; buy as many contracts as allocation allows (min 1)
+        contracts = max(1, int(allocation / cost_per_contract))
+        total_cost = round(contracts * cost_per_contract, 2)
+
+        profit_target = round(ask * 1.50, 2)   # +50 % (monthly options need bigger move)
+        stop_loss     = round(ask * 0.50, 2)   # −50 %
+        profit_pnl    = round(contracts * (profit_target - ask) * 100, 2)
+        loss_pnl      = round(contracts * (stop_loss     - ask) * 100, 2)
+
+        picks.append({
+            "rank": len(picks) + 1,
+            "symbol": sym,
+            "direction": candidate["direction"],
+            "stock_price": round(chain["quote_price"], 2),
+            # Option
+            "strike": best["strike"],
+            "expiry_date": chain["expiry_date"],
+            "dte": chain["dte"],
+            "contract_symbol": best["contract_symbol"],
+            # Pricing
+            "bid_price": best["bid"],
+            "ask_price": ask,
+            "mid_price": best["mid"],
+            "price_is_last": best.get("price_is_last", False),
+            "entry_note": ("Prices from last close — verify live prices before trading" if best.get("price_is_last")
+                           else "Use limit order at mid price for best fill"),
+            # Greeks
+            "delta": best["delta"],
+            "theta": best["theta"],
+            "implied_volatility": best["implied_volatility"],
+            "spread_pct": best["spread_pct"],
+            "in_the_money": best["in_the_money"],
+            # Liquidity
+            "option_volume": best["volume"],
+            "open_interest": best["open_interest"],
+            # Sizing
+            "contracts": contracts,
+            "total_cost": total_cost,
+            "allocation": round(allocation, 2),
+            # Bracket order
+            "profit_target_price": profit_target,
+            "stop_loss_price": stop_loss,
+            "profit_target_pnl": profit_pnl,
+            "stop_loss_pnl": loss_pnl,
+            # Context
+            "momentum_score": candidate["score"],
+            "rsi": candidate["rsi"],
+            "price_vs_sma20": candidate["price_vs_sma20"],
+            "ai_analysis": None,
+            "ai_risk": None,
+            "ai_entry_time": None,
+        })
+
+    # ── 3. AI rationale for each pick ─────────────────────────────────────────
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if api_key and ANTHROPIC_AVAILABLE and picks:
+        try:
+            client = anthropic.Anthropic(api_key=api_key)
+            summary = json.dumps([{
+                "symbol": p["symbol"], "direction": p["direction"],
+                "stock_price": p["stock_price"], "strike": p["strike"],
+                "expiry_date": p["expiry_date"], "dte": p["dte"],
+                "ask_price": p["ask_price"], "delta": p["delta"],
+                "iv_pct": p["implied_volatility"], "rsi": p["rsi"],
+                "price_vs_sma20": p["price_vs_sma20"],
+                "momentum_score": p["momentum_score"],
+            } for p in picks], indent=2)
+
+            prompt = f"""You are an expert options swing trader selecting the best 20-45 DTE trades.
+Today's top {len(picks)} option picks (capital: ${capital:.0f}):
+{summary}
+
+For EACH pick write a concise analysis. Return ONLY a valid JSON array:
+[
+  {{
+    "symbol": "AAPL",
+    "analysis": "2-3 sentences: why this direction, what technical/fundamental setup justifies it, what move in the stock is needed over the next 2-4 weeks",
+    "key_risk": "1 sentence: main risk that could invalidate this trade",
+    "ideal_entry_time": "e.g. 'Enter on a pullback to the 20-day SMA or on a breakout above $XXX' — be specific about the entry condition"
+  }}
+]"""
+            resp = client.messages.create(
+                model="claude-sonnet-4-6", max_tokens=1024,
+                system="Expert options trader. Return only valid JSON array, no markdown.",
+                messages=[{"role": "user", "content": prompt}]
+            )
+            txt = resp.content[0].text.strip()
+            m = re.search(r'\[.*\]', txt, re.DOTALL)
+            if m:
+                ai_list = json.loads(m.group())
+                ai_map = {a["symbol"]: a for a in ai_list}
+                for p in picks:
+                    ai = ai_map.get(p["symbol"])
+                    if ai:
+                        p["ai_analysis"]   = ai.get("analysis")
+                        p["ai_risk"]       = ai.get("key_risk")
+                        p["ai_entry_time"] = ai.get("ideal_entry_time")
+        except Exception as e:
+            print(f"AI options error: {e}")
+
+    prices_are_last = picks and any(p.get("price_is_last") for p in picks)
+    result = {
+        "_key": cache_key,
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "scan_time_utc": datetime.now(timezone.utc).strftime("%H:%M UTC"),
+        "market_open": not prices_are_last,
+        "capital": capital,
+        "picks": picks,
+        "strategy": {
+            "type": "Long Calls / Long Puts (20-45 DTE)",
+            "entry_window": "Enter on limit order at mid-price during regular hours",
+            "profit_target": "+50% on option premium (sell to close)",
+            "stop_loss": "−50% on option premium (sell to close)",
+            "order_type": "Sell-to-close when target or stop is hit — do not hold to expiry",
+            "note": "Monthly options give more time for the trade to work. Adjust stop/target based on conviction.",
+        },
+    }
+
+    _opt_cache = result
+    _opt_cache_ts = time.time()
+    return result
+
+
+@app.delete("/api/options/cache")
+async def clear_options_cache():
+    global _opt_cache, _opt_cache_ts
+    _opt_cache = None; _opt_cache_ts = 0
+    return {"status": "options cache cleared"}
 
 
 # ─── Serve React Frontend ─────────────────────────────────────────────────────

@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { ArrowLeft, TrendingUp, TrendingDown, Minus, BarChart2, BookOpen, Target, Building2, AlertCircle } from 'lucide-react'
+import { ArrowLeft, BarChart2, BookOpen, Target, Building2, AlertCircle } from 'lucide-react'
 import type { AnalysisResults, StockResult } from '../types/stock'
 import CandlestickChart from '../components/CandlestickChart'
 import IndicatorCharts from '../components/IndicatorCharts'
@@ -128,6 +128,12 @@ export default function AnalysisPage({ results, onBack }: Props) {
   const stock = results[activeSymbol]
   const hasError = !stock || ('error' in stock && !stock.company_name)
 
+  const sr = hasError ? null : (stock as StockResult)
+  const candles = sr?.technical.candles ?? []
+  const prevClose = candles.length >= 2 ? candles[candles.length - 2].close : null
+  const dayChange = sr && prevClose !== null ? sr.current_price - prevClose : null
+  const dayChangePct = dayChange !== null && prevClose ? (dayChange / prevClose) * 100 : null
+
   return (
     <div className="min-h-screen flex flex-col">
       {/* Top bar */}
@@ -212,6 +218,11 @@ export default function AnalysisPage({ results, onBack }: Props) {
               </div>
               <div className="text-right flex-shrink-0">
                 <p className="text-3xl font-bold text-white">${stock.current_price.toFixed(2)}</p>
+                {dayChange !== null && dayChangePct !== null && (
+                  <p className={`text-sm font-semibold ${dayChange >= 0 ? 'text-green-400' : 'text-red-400'}`}>
+                    {dayChange >= 0 ? '+' : ''}{dayChange.toFixed(2)} ({dayChangePct >= 0 ? '+' : ''}{dayChangePct.toFixed(2)}%)
+                  </p>
+                )}
                 <p className="text-xs text-slate-400">{stock.currency}</p>
               </div>
             </div>

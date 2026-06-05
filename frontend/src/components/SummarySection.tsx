@@ -1,3 +1,4 @@
+import { useEffect, useState } from 'react'
 import type { StockResult } from '../types/stock'
 import { TrendingUp, TrendingDown, Minus, Target, AlertTriangle, Zap, Clock, PieChart } from 'lucide-react'
 
@@ -19,6 +20,14 @@ function ActionBadge({ action }: { action: string }) {
 }
 
 function ScoreBar({ label, score, color }: { label: string; score: number; color: string }) {
+  const [width, setWidth] = useState(0)
+
+  useEffect(() => {
+    setWidth(0)
+    const id = requestAnimationFrame(() => requestAnimationFrame(() => setWidth(score)))
+    return () => cancelAnimationFrame(id)
+  }, [score])
+
   return (
     <div>
       <div className="flex justify-between text-xs mb-1">
@@ -26,7 +35,10 @@ function ScoreBar({ label, score, color }: { label: string; score: number; color
         <span className={`font-semibold ${color}`}>{score.toFixed(0)}/100</span>
       </div>
       <div className="w-full bg-surface rounded-full h-2">
-        <div className={`h-2 rounded-full ${color.replace('text-', 'bg-')}`} style={{ width: `${score}%` }} />
+        <div
+          className={`h-2 rounded-full ${color.replace('text-', 'bg-')}`}
+          style={{ width: `${width}%`, transition: 'width 0.8s ease-out' }}
+        />
       </div>
     </div>
   )
@@ -54,7 +66,7 @@ function FibTable({ levels, currentPrice }: { levels: Record<string, number>; cu
 }
 
 export default function SummarySection({ stock }: { stock: StockResult }) {
-  const { recommendation: rec, entry_point, ai_analysis: ai, current_price, technical, fundamental } = stock
+  const { recommendation: rec, entry_point, ai_analysis: ai, current_price, technical } = stock
   const techColor = rec.technical_score >= 70 ? 'text-green-400' : rec.technical_score >= 45 ? 'text-yellow-400' : 'text-red-400'
   const fundColor = rec.fundamental_score >= 70 ? 'text-green-400' : rec.fundamental_score >= 45 ? 'text-yellow-400' : 'text-red-400'
   const combColor = rec.combined_score >= 70 ? 'text-green-400' : rec.combined_score >= 45 ? 'text-yellow-400' : 'text-red-400'
