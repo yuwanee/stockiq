@@ -205,6 +205,11 @@ class YFClient:
             info.setdefault("longBusinessSummary",  p.get("longBusinessSummary"))
             info.setdefault("fundFamily",           p.get("fundFamily"))
             info.setdefault("category",             p.get("category"))
+            info.setdefault("fullTimeEmployees",    p.get("fullTimeEmployees"))
+            info.setdefault("website",              p.get("website"))
+            info.setdefault("city",                 p.get("city"))
+            info.setdefault("state",                p.get("state"))
+            info.setdefault("country",              p.get("country"))
 
         fd = data.get("financialData") or {}
         for k in ["revenueGrowth","earningsGrowth","grossMargins","operatingMargins",
@@ -227,7 +232,7 @@ class YFClient:
             if info.get(k) is None:
                 info[k] = R(sd.get(k))
 
-        # recommendationMean from trend
+        # recommendationMean + individual analyst counts from trend
         rt = (data.get("recommendationTrend") or {}).get("trend") or []
         if rt:
             t = rt[0]
@@ -236,6 +241,13 @@ class YFClient:
                 weighted = (t.get("strongBuy",0)*1 + t.get("buy",0)*2 +
                             t.get("hold",0)*3 + t.get("sell",0)*4 + t.get("strongSell",0)*5)
                 info["recommendationMean"] = weighted / total
+                info["_analystCounts"] = {
+                    "strongBuy":  t.get("strongBuy", 0),
+                    "buy":        t.get("buy", 0),
+                    "hold":       t.get("hold", 0),
+                    "sell":       t.get("sell", 0),
+                    "strongSell": t.get("strongSell", 0),
+                }
 
         # ETF holdings from topHoldings
         th = data.get("topHoldings") or {}
@@ -751,7 +763,7 @@ async def analyze(request: AnalyzeRequest):
                     "recommendation_mean":info.get("recommendationMean"),
                     "target_high":th_,"target_low":tl,"target_mean":tm,
                     "analyst_count":info.get("numberOfAnalystOpinions"),
-                    "description":(info.get("longBusinessSummary") or "")[:600],
+                    "description":(info.get("longBusinessSummary") or "")[:1500],
                     "news":news,"fundamental_score":round(fscore*100,1),
                 },
                 "etf_data": etf_data,
@@ -760,6 +772,16 @@ async def analyze(request: AnalyzeRequest):
                     "suggested_price":entry,"note":enote,"target_mean":tm,
                     "target_high":th_,"target_low":tl,
                     "upside_pct":round((tm/price-1)*100,1) if tm and price else None,
+                },
+                "company_info": {
+                    "full_description": info.get("longBusinessSummary") or "",
+                    "employees":        info.get("fullTimeEmployees"),
+                    "website":          info.get("website"),
+                    "city":             info.get("city"),
+                    "state":            info.get("state"),
+                    "country":          info.get("country"),
+                    "exchange":         info.get("exchange"),
+                    "analyst_counts":   info.get("_analystCounts"),
                 },
                 "ai_analysis": ai,
             }

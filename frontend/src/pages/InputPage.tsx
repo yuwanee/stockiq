@@ -4,7 +4,26 @@ import { analyzeStocks } from '../services/api'
 import type { AnalysisResults } from '../types/stock'
 import AppNav, { type AppView } from '../components/AppNav'
 
-const EXAMPLES = ['AAPL', 'NVDA', 'TSLA', 'MSFT', 'GOOGL', 'SPY', 'QQQ', 'VTI', 'ARKK', 'GLD', 'AGG', 'XLK']
+const MARKETS = [
+  { code: 'US',      label: 'US Markets',               suffix: '',    flag: '🇺🇸', hint: 'AAPL, NVDA, SPY' },
+  { code: 'SET',     label: 'Thailand (SET)',            suffix: '.BK', flag: '🇹🇭', hint: 'SCB, PTT, ADVANC' },
+  { code: 'LSE',     label: 'UK (LSE)',                  suffix: '.L',  flag: '🇬🇧', hint: 'HSBA, BP, GSK' },
+  { code: 'TSE',     label: 'Japan (TSE)',               suffix: '.T',  flag: '🇯🇵', hint: '7203, 6758, 9984' },
+  { code: 'HKEX',   label: 'Hong Kong (HKEX)',          suffix: '.HK', flag: '🇭🇰', hint: '0700, 0005, 2318' },
+  { code: 'SGX',    label: 'Singapore (SGX)',            suffix: '.SI', flag: '🇸🇬', hint: 'D05, U11, Z74' },
+  { code: 'XETRA',  label: 'Germany (XETRA)',           suffix: '.DE', flag: '🇩🇪', hint: 'SAP, SIE, BMW' },
+  { code: 'EPA',    label: 'France (Euronext)',          suffix: '.PA', flag: '🇫🇷', hint: 'BNP, AIR, MC' },
+  { code: 'ASX',    label: 'Australia (ASX)',            suffix: '.AX', flag: '🇦🇺', hint: 'CBA, BHP, CSL' },
+  { code: 'TSX',    label: 'Canada (TSX)',               suffix: '.TO', flag: '🇨🇦', hint: 'RY, TD, CNR' },
+  { code: 'KRX',    label: 'South Korea (KRX)',          suffix: '.KS', flag: '🇰🇷', hint: '005930, 000660' },
+  { code: 'NSE',    label: 'India (NSE)',                suffix: '.NS', flag: '🇮🇳', hint: 'RELIANCE, TCS' },
+  { code: 'SSE',    label: 'China Shanghai (SSE)',       suffix: '.SS', flag: '🇨🇳', hint: '600519, 601398' },
+  { code: 'SZSE',   label: 'China Shenzhen (SZSE)',      suffix: '.SZ', flag: '🇨🇳', hint: '000001, 300750' },
+  { code: 'TWSE',   label: 'Taiwan (TWSE)',              suffix: '.TW', flag: '🇹🇼', hint: '2330, 2454' },
+  { code: 'BOVESPA',label: 'Brazil (B3)',                suffix: '.SA', flag: '🇧🇷', hint: 'PETR4, VALE3' },
+]
+
+const US_EXAMPLES = ['AAPL', 'NVDA', 'TSLA', 'MSFT', 'GOOGL', 'SPY', 'QQQ', 'VTI', 'ARKK', 'GLD']
 
 interface Props {
   onResults: (r: AnalysisResults) => void
@@ -15,12 +34,19 @@ interface Props {
 export default function InputPage({ onResults, onNavigate, serverReady = true }: Props) {
   const [input, setInput] = useState('')
   const [symbols, setSymbols] = useState<string[]>([])
+  const [market, setMarket] = useState(MARKETS[0])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
   const [progress, setProgress] = useState('')
 
+  function applyMarket(raw: string): string {
+    const s = raw.toUpperCase().trim()
+    if (!market.suffix || s.includes('.')) return s
+    return s + market.suffix
+  }
+
   function addSymbol(raw: string) {
-    const parts = raw.toUpperCase().split(/[\s,;]+/).filter(Boolean)
+    const parts = raw.toUpperCase().split(/[\s,;]+/).filter(Boolean).map(applyMarket)
     setSymbols(prev => {
       const next = [...prev]
       for (const s of parts) if (s && !next.includes(s)) next.push(s)
@@ -86,7 +112,32 @@ export default function InputPage({ onResults, onNavigate, serverReady = true }:
 
         {/* Input Card */}
         <div className="w-full max-w-2xl bg-panel border border-border rounded-2xl p-6 shadow-2xl">
-          <label className="block text-sm font-medium text-slate-300 mb-3">Stock Symbols</label>
+          {/* Market selector */}
+          <div className="flex items-center gap-3 mb-4">
+            <label className="text-sm font-medium text-slate-300 flex-shrink-0">Market</label>
+            <select
+              value={market.code}
+              onChange={e => setMarket(MARKETS.find(m => m.code === e.target.value) ?? MARKETS[0])}
+              disabled={loading}
+              className="flex-1 bg-surface border border-border text-slate-200 text-sm rounded-lg px-3 py-2 focus:outline-none focus:border-accent transition-colors"
+            >
+              {MARKETS.map(m => (
+                <option key={m.code} value={m.code}>{m.flag} {m.label}</option>
+              ))}
+            </select>
+            {market.code !== 'US' && (
+              <span className="text-xs text-accent bg-accent/10 border border-accent/30 px-2 py-1 rounded-lg flex-shrink-0">
+                suffix: {market.suffix}
+              </span>
+            )}
+          </div>
+
+          <label className="block text-sm font-medium text-slate-300 mb-3">
+            Stock Symbols
+            {market.code !== 'US' && (
+              <span className="ml-2 text-xs text-slate-500 font-normal">e.g. {market.hint}</span>
+            )}
+          </label>
 
           {/* Tag input */}
           <div
@@ -118,25 +169,27 @@ export default function InputPage({ onResults, onNavigate, serverReady = true }:
             <kbd className="bg-border px-1 py-0.5 rounded text-slate-300">,</kbd> to add each symbol
           </p>
 
-          {/* Quick picks */}
-          <div className="mt-4">
-            <p className="text-xs text-slate-500 mb-2">Quick picks:</p>
-            <div className="flex flex-wrap gap-2">
-              {EXAMPLES.map(s => (
-                <button
-                  key={s}
-                  onClick={() => setSymbols(prev => prev.includes(s) ? prev : [...prev, s])}
-                  className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
-                    symbols.includes(s)
-                      ? 'bg-accent/20 border-accent/40 text-accent'
-                      : 'bg-surface border-border text-slate-400 hover:border-accent/50 hover:text-slate-200'
-                  }`}
-                >
-                  {s}
-                </button>
-              ))}
+          {/* Quick picks — only shown for US market */}
+          {market.code === 'US' && (
+            <div className="mt-4">
+              <p className="text-xs text-slate-500 mb-2">Quick picks:</p>
+              <div className="flex flex-wrap gap-2">
+                {US_EXAMPLES.map(s => (
+                  <button
+                    key={s}
+                    onClick={() => setSymbols(prev => prev.includes(s) ? prev : [...prev, s])}
+                    className={`text-xs px-2.5 py-1 rounded-lg border transition-colors ${
+                      symbols.includes(s)
+                        ? 'bg-accent/20 border-accent/40 text-accent'
+                        : 'bg-surface border-border text-slate-400 hover:border-accent/50 hover:text-slate-200'
+                    }`}
+                  >
+                    {s}
+                  </button>
+                ))}
+              </div>
             </div>
-          </div>
+          )}
 
           {error && <p className="mt-3 text-sm text-red-400">{error}</p>}
           {progress && <p className="mt-3 text-sm text-accent animate-pulse">{progress}</p>}

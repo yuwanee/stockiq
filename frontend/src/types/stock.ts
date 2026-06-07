@@ -184,6 +184,25 @@ export interface ETFData {
   description: string
 }
 
+export interface AnalystCounts {
+  strongBuy: number
+  buy: number
+  hold: number
+  sell: number
+  strongSell: number
+}
+
+export interface CompanyInfo {
+  full_description: string
+  employees: number | null
+  website: string | null
+  city: string | null
+  state: string | null
+  country: string | null
+  exchange: string | null
+  analyst_counts: AnalystCounts | null
+}
+
 export interface StockResult {
   symbol: string
   is_etf: boolean
@@ -200,6 +219,7 @@ export interface StockResult {
   etf_data: ETFData | null
   recommendation: Recommendation
   entry_point: EntryPoint
+  company_info: CompanyInfo | null
   ai_analysis: AIAnalysis | null
   error?: string
 }

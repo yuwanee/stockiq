@@ -1,13 +1,15 @@
 import { useState } from 'react'
-import { ArrowLeft, BarChart2, BookOpen, Target, Building2, AlertCircle } from 'lucide-react'
+import { ArrowLeft, BarChart2, BookOpen, Target, Building2, AlertCircle, Info } from 'lucide-react'
 import type { AnalysisResults, StockResult } from '../types/stock'
 import CandlestickChart from '../components/CandlestickChart'
 import IndicatorCharts from '../components/IndicatorCharts'
 import SignalsList from '../components/SignalsList'
 import FundamentalSection from '../components/FundamentalSection'
 import SummarySection from '../components/SummarySection'
+import InfoSection from '../components/InfoSection'
 
 const TAB_ICONS = {
+  info: <Info className="w-4 h-4" />,
   technical: <BarChart2 className="w-4 h-4" />,
   fundamental: <BookOpen className="w-4 h-4" />,
   summary: <Target className="w-4 h-4" />,
@@ -122,7 +124,7 @@ interface Props {
 export default function AnalysisPage({ results, onBack }: Props) {
   const symbols = Object.keys(results)
   const [activeSymbol, setActiveSymbol] = useState(symbols[0])
-  const [activeTab, setActiveTab] = useState<'technical' | 'fundamental' | 'summary'>('technical')
+  const [activeTab, setActiveTab] = useState<'info' | 'technical' | 'fundamental' | 'summary'>('info')
   const [showOverall, setShowOverall] = useState(false)
 
   const stock = results[activeSymbol]
@@ -229,7 +231,7 @@ export default function AnalysisPage({ results, onBack }: Props) {
 
             {/* Sub-tabs */}
             <div className="flex border-b border-border mb-5">
-              {(['technical', 'fundamental', 'summary'] as const).map(tab => (
+              {(['info', 'technical', 'fundamental', 'summary'] as const).map(tab => (
                 <button
                   key={tab}
                   onClick={() => setActiveTab(tab)}
@@ -243,6 +245,8 @@ export default function AnalysisPage({ results, onBack }: Props) {
             </div>
 
             {/* Tab content */}
+            {activeTab === 'info' && <InfoSection stock={sr!} />}
+
             {activeTab === 'technical' && (
               <div className="space-y-5">
                 {/* Price chart */}
