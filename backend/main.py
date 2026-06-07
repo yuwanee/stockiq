@@ -44,28 +44,47 @@ class YFClient:
     def __init__(self):
         self._session = requests.Session()
         self._session.headers.update({
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,*/*;q=0.8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
             "Accept-Language": "en-US,en;q=0.9",
             "Accept-Encoding": "gzip, deflate, br",
+            "Referer": "https://finance.yahoo.com/",
         })
         self._crumb: Optional[str] = None
-        self._crumb_for: str = ""
 
-    def _get_crumb(self, symbol: str) -> bool:
-        """Fetch cookies + crumb from Yahoo Finance page (extracted from HTML)."""
-        if self._crumb and self._crumb_for == symbol:
+    def _get_crumb(self, symbol: str = "") -> bool:
+        """Fetch session cookies + crumb. Crumb is session-scoped, not per symbol."""
+        if self._crumb:
             return True
         try:
+            # Step 1: establish session cookies via homepage
+            self._session.get("https://finance.yahoo.com/", timeout=15)
+            # Step 2: fetch crumb from dedicated endpoint (more reliable than HTML parse)
             r = self._session.get(
-                f"https://finance.yahoo.com/quote/{symbol}",
-                timeout=15
+                "https://query1.finance.yahoo.com/v1/test/getcrumb",
+                timeout=10
             )
-            m = re.search(r'"crumb":"([^"]+)"', r.text)
-            if m:
-                self._crumb = m.group(1).encode().decode("unicode_escape")
-                self._crumb_for = symbol
+            if r.status_code == 200 and r.text.strip():
+                self._crumb = r.text.strip()
                 return True
+            # Fallback: try query2
+            r = self._session.get(
+                "https://query2.finance.yahoo.com/v1/test/getcrumb",
+                timeout=10
+            )
+            if r.status_code == 200 and r.text.strip():
+                self._crumb = r.text.strip()
+                return True
+            # Last resort: parse from quote page HTML
+            if symbol:
+                r = self._session.get(
+                    f"https://finance.yahoo.com/quote/{symbol}",
+                    timeout=15
+                )
+                m = re.search(r'"crumb":"([^"]+)"', r.text)
+                if m:
+                    self._crumb = m.group(1).encode().decode("unicode_escape")
+                    return True
         except Exception as e:
             print(f"Crumb fetch failed: {e}")
         return False
@@ -100,7 +119,7 @@ class YFClient:
                         result = data.get("chart", {}).get("result") or []
                         if result:
                             return self._parse_chart(result[0])
-                    elif r.status_code == 401:
+                    elif r.status_code in (401, 403):
                         self._crumb = None
                         self._get_crumb(symbol)
                         if self._crumb:
@@ -153,7 +172,7 @@ class YFClient:
                         results = (data.get("quoteSummary") or {}).get("result") or []
                         if results:
                             return self._parse_info(results[0])
-                    elif r.status_code == 401:
+                    elif r.status_code in (401, 403):
                         self._crumb = None
                         self._get_crumb(symbol)
                         if self._crumb:

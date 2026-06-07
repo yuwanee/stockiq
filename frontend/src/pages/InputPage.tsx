@@ -9,9 +9,10 @@ const EXAMPLES = ['AAPL', 'NVDA', 'TSLA', 'MSFT', 'GOOGL', 'SPY', 'QQQ', 'VTI', 
 interface Props {
   onResults: (r: AnalysisResults) => void
   onNavigate: (v: AppView) => void
+  serverReady?: boolean
 }
 
-export default function InputPage({ onResults, onNavigate }: Props) {
+export default function InputPage({ onResults, onNavigate, serverReady = true }: Props) {
   const [input, setInput] = useState('')
   const [symbols, setSymbols] = useState<string[]>([])
   const [loading, setLoading] = useState(false)
@@ -55,7 +56,12 @@ export default function InputPage({ onResults, onNavigate }: Props) {
       const results = await analyzeStocks(all)
       onResults(results)
     } catch (e: any) {
-      setError(e?.response?.data?.detail || e.message || 'Analysis failed. Is the backend running?')
+      const msg = e?.response?.data?.detail || e.message || ''
+      setError(
+        msg.includes('timeout') || msg.includes('ECONNABORTED')
+          ? 'Request timed out. The server may be waking up — please try again in a moment.'
+          : msg || 'Analysis failed. Is the backend running?'
+      )
     } finally {
       setLoading(false)
       setProgress('')
@@ -137,11 +143,13 @@ export default function InputPage({ onResults, onNavigate }: Props) {
 
           <button
             onClick={analyze}
-            disabled={loading}
+            disabled={loading || !serverReady}
             className="mt-5 w-full flex items-center justify-center gap-2 bg-accent hover:bg-blue-500 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold py-3 px-6 rounded-xl transition-colors text-sm"
           >
             {loading ? (
               <><Loader2 className="w-4 h-4 animate-spin" /> Analyzing…</>
+            ) : !serverReady ? (
+              <><Loader2 className="w-4 h-4 animate-spin" /> Connecting to server…</>
             ) : (
               <><Search className="w-4 h-4" /> Analyze Stocks</>
             )}
